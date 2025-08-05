@@ -19,7 +19,7 @@ app = Client("my_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 # Обработка команды /start
 @app.on_message(filters.command("start"))
 def start_handler(client, message):
-    message.reply_text("Привет! Я бот с интеллектом ChatGPT через OpenRouter 🤖")
+    message.reply_text("Привет! Я бот с интеллектом через OpenRouter 🤖")
 
 # Обработка текстовых сообщений
 @app.on_message(filters.text & ~filters.command("start"))
@@ -30,12 +30,12 @@ def text_handler(client_tg, message):
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://eltri.ru/",  # замените на свой URL
-            "X-Title": "MyTelegramBot"
+            "HTTP-Referer": "https://pavel529-ux.github.io",  # Обнови при необходимости
+            "X-Title": "TelegramBotTest"
         }
 
         payload = {
-            ""model": "openai/gpt-oss-120b",  # БЕСПЛАТНАЯ модель
+            "model": "openai/gpt-oss-120b",  # БЕСПЛАТНАЯ модель
             "messages": [
                 {"role": "system", "content": "Ты — дружелюбный Telegram-бот."},
                 {"role": "user", "content": user_text}
@@ -63,6 +63,7 @@ def text_handler(client_tg, message):
 
 # Запуск бота
 app.run()
+
 
 
 
