@@ -35,7 +35,7 @@ def text_handler(client_tg, message):
         }
 
         payload = {
-            "model": "openai/gpt-3.5-turbo",  # можно заменить на другой
+            "model": "mistralai/mistral-7b-instruct",  # можно заменить на другой
             "messages": [
                 {"role": "system", "content": "Ты — дружелюбный Telegram-бот."},
                 {"role": "user", "content": user_text}
