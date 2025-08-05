@@ -30,8 +30,6 @@ def text_handler(client_tg, message):
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://pavel529-ux.github.io",  # Обнови при необходимости
-            "X-Title": "TelegramBotTest"
         }
 
         payload = {
