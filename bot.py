@@ -4,10 +4,10 @@ import os
 import requests
 import traceback
 
-# Загружаем переменные из .env
+# Загружаем переменные из .env или среды (например, Railway)
 load_dotenv()
 
-# Получаем токены из окружения
+# Получаем токены из переменных окружения
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
@@ -21,29 +21,30 @@ app = Client("my_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 def start_handler(client, message):
     message.reply_text("Привет! Я бот с интеллектом ChatGPT через OpenRouter 🤖")
 
-# Обработка текстовых сообщений
+# Обработка обычных текстовых сообщений
 @app.on_message(filters.text & ~filters.command("start"))
 def text_handler(client_tg, message):
     user_text = message.text
 
     try:
         headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",  # для ключей вида sk-or-...
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://openrouter.ai",
             "X-Title": "My Telegram Bot"
         }
 
         payload = {
-            "model": "openai/gpt-3.5-turbo",  # можно заменить на "openai/gpt-4", "anthropic/claude-3-haiku" и т.д.
+            "model": "openai/gpt-3.5-turbo",
             "messages": [
                 {"role": "system", "content": "Ты — дружелюбный Telegram-бот."},
                 {"role": "user", "content": user_text}
             ]
         }
 
+        # ✅ Новый корректный URL:
         response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            "https://openrouter.ai/v1/chat/completions",  # ← исправлено
             headers=headers,
             json=payload
         )
@@ -59,6 +60,7 @@ def text_handler(client_tg, message):
 
 # Запуск бота
 app.run()
+
 
 
 
