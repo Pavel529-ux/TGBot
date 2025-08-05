@@ -4,6 +4,9 @@ import os
 import requests
 import traceback
 
+print("✅ Bot is starting up...")
+
+
 # Загружаем переменные из .env или среды (например, Railway)
 load_dotenv()
 
