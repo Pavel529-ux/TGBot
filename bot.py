@@ -28,14 +28,14 @@ def text_handler(client_tg, message):
 
     try:
         headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",  # ключ вида sk-or-...
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://openrouter.ai",
-            "X-Title": "My Telegram Bot"
+            "HTTP-Referer": "https://pavel529-ux.github.io",  # замените на свой URL
+            "X-Title": "MyTelegramBot"
         }
 
         payload = {
-            "model": "mistralai/mistral-7b-instruct",  # можно заменить на другой
+            "model": "mistralai/mistral-7b-instruct",  # БЕСПЛАТНАЯ модель
             "messages": [
                 {"role": "system", "content": "Ты — дружелюбный Telegram-бот."},
                 {"role": "user", "content": user_text}
@@ -51,24 +51,19 @@ def text_handler(client_tg, message):
         print("STATUS:", response.status_code)
         print("RESPONSE TEXT:", response.text)
 
-        # Проверяем, успешно ли выполнен запрос
-        if response.status_code != 200:
-            message.reply_text(f"❌ OpenRouter вернул ошибку: {response.status_code}\n{response.text}")
-            return
+        response.raise_for_status()  # выбрасывает ошибку, если не 2xx
 
-        # Если всё хорошо, парсим ответ
         reply = response.json()["choices"][0]["message"]["content"]
         message.reply_text(reply)
 
     except Exception as e:
         print("❌ Ошибка OpenRouter:")
         traceback.print_exc()
-        message.reply_text("Произошла ошибка при обращении к OpenRouter 🤖")
+        message.reply_text("Произошла ошибка при общении с OpenRouter 🤖")
 
 # Запуск бота
-print("✅ Бот запускается...")
 app.run()
-print("🤖 Готов к работе. Ожидаю сообщения...")
+
 
 
 
