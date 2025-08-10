@@ -27,7 +27,7 @@ OR_MODEL = os.getenv("OR_TEXT_MODEL", "openai/gpt-oss-120b")
 
 # Hugging Face (картинки)
 HF_TOKEN = os.getenv("HF_TOKEN")
-HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "runwayml/stable-diffusion-v1-5")
+HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "stabilityai/sd-turbo")  # дефолт — быстрая публичная модель
 
 missing = [k for k, v in {
     "BOT_TOKEN": BOT_TOKEN,
@@ -112,7 +112,6 @@ def text_handler(_, message):
 
         log.info("TEXT %s | %s", resp.status_code, resp.headers.get("content-type", ""))
         if resp.status_code != 200:
-            # иногда OpenRouter может вернуть HTML/редирект — покажем небольшой фрагмент
             snippet = (resp.text or "")[:600]
             message.reply_text(f"❌ OpenRouter {resp.status_code}\n{snippet}")
             return
@@ -138,30 +137,36 @@ def image_handler(_, message):
         return
 
     try:
-        url = f"https://api-inference.huggingface.co/models/{HF_IMAGE_MODEL}"
+        model_id = (os.getenv("HF_IMAGE_MODEL") or HF_IMAGE_MODEL).strip()
+        url = f"https://api-inference.huggingface.co/models/{model_id}"
         headers = {
             "Authorization": f"Bearer {HF_TOKEN}",
-            "Accept": "image/png"  # просим отдать PNG
+            "Accept": "image/png"  # просим PNG
         }
         payload = {
             "inputs": prompt,
-            "options": {"wait_for_model": True}  # дождаться «пробуждения»
+            "options": {"wait_for_model": True}  # дождёмся «пробуждения»
         }
 
+        log.info("IMG call → %s", url)
         resp = requests.post(url, headers=headers, json=payload, timeout=180)
         ct = resp.headers.get("content-type", "")
         log.info("IMG %s | %s", resp.status_code, ct)
 
-        # Успех: пришёл бинарный PNG/JPEG
-        if resp.status_code == 200 and ct.startswith("image/"):
+        # Успех: пришло изображение
+        if resp.status_code == 200 and isinstance(ct, str) and ct.startswith("image/"):
             bio = BytesIO(resp.content)
             bio.name = "image.png"
             message.reply_photo(bio, caption=f"🎨 По запросу: {prompt}")
             return
 
-        # Иначе покажем короткое тело ответа для диагностики
+        # Диагностика при ошибке
         snippet = (resp.text or "")[:800]
-        message.reply_text(f"❌ Hugging Face {resp.status_code}\n{snippet}")
+        message.reply_text(
+            "❌ Hugging Face {code}\nМодель: {model}\nURL: {url}\n\n{body}".format(
+                code=resp.status_code, model=model_id, url=url, body=snippet
+            )
+        )
 
     except Exception:
         traceback.print_exc()
