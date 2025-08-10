@@ -21,13 +21,13 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID_STR = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 
-# OpenRouter (текст)
+# Текст (OpenRouter)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OR_MODEL = os.getenv("OR_TEXT_MODEL", "openai/gpt-oss-120b")
 
-# Hugging Face (картинки)
+# Картинки (Hugging Face) — дефолт на SDXL Base 1.0
 HF_TOKEN = os.getenv("HF_TOKEN")
-HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "stabilityai/sdxl-turbo")
+HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "stabilityai/stable-diffusion-xl-base-1.0")
 
 missing = [k for k, v in {
     "BOT_TOKEN": BOT_TOKEN,
@@ -72,10 +72,10 @@ def start_handler(_, message):
     uid = message.from_user.id
     chat_history[uid] = []
     message.reply_text(
-        "Привет! Я бот с памятью 🤖\n"
-        "— Пиши сообщения: я учитываю контекст последних 10 реплик.\n"
-        "— Сгенерировать картинку: /img кот в космосе\n"
-        "— Очистить память: /reset"
+        "Привет! Я бот с памятью и генерацией картинок 🤖\n"
+        "— Просто пиши, я учитываю последние 10 реплик.\n"
+        "— Картинка: /img кот в космосе\n"
+        "— Сбросить контекст: /reset"
     )
 
 @app.on_message(filters.command("reset"))
@@ -84,7 +84,7 @@ def reset_handler(_, message):
     chat_history[uid] = []
     message.reply_text("🧹 Память очищена!")
 
-# ---------- ТЕКСТ С ПАМЯТЬЮ (OpenRouter) ----------
+# ---------- ТЕКСТ (OpenRouter) ----------
 @app.on_message(filters.text & ~filters.command(["start", "reset", "img"]))
 def text_handler(_, message):
     uid = message.from_user.id
@@ -128,7 +128,7 @@ def text_handler(_, message):
         traceback.print_exc()
         message.reply_text("Произошла ошибка при общении с OpenRouter 🤖")
 
-# ---------- КАРТИНКИ /img (Hugging Face Inference API) ----------
+# ---------- КАРТИНКИ /img (Hugging Face: SDXL Base 1.0) ----------
 @app.on_message(filters.command("img"))
 def image_handler(_, message):
     prompt = " ".join(message.command[1:]).strip()
@@ -137,7 +137,8 @@ def image_handler(_, message):
         return
 
     try:
-        url = f"https://api-inference.huggingface.co/models/{HF_IMAGE_MODEL}"
+        model = HF_IMAGE_MODEL.strip()
+        url = f"https://api-inference.huggingface.co/models/{model}"
         headers = {
             "Authorization": f"Bearer {HF_TOKEN}",
             "Accept": "image/png"
@@ -147,18 +148,36 @@ def image_handler(_, message):
             "options": {"wait_for_model": True}
         }
 
-        resp = requests.post(url, headers=headers, json=payload, timeout=180)
+        log.info("IMG CALL -> model=%r url=%r", model, url)
+        resp = requests.post(url, headers=headers, json=payload, timeout=300)
         ct = resp.headers.get("content-type", "")
         log.info("IMG %s | %s", resp.status_code, ct)
 
+        # Успех — байтовое изображение
         if resp.status_code == 200 and ct.startswith("image/"):
             bio = BytesIO(resp.content)
             bio.name = "image.png"
             message.reply_photo(bio, caption=f"🎨 По запросу: {prompt}")
             return
 
-        snippet = (resp.text or "")[:800]
-        message.reply_text(f"❌ Hugging Face {resp.status_code}\n{snippet}")
+        # Частые случаи
+        body = (resp.text or "")[:800]
+        if resp.status_code == 404:
+            message.reply_text(
+                "❌ Hugging Face 404 (модель не найдена)\n"
+                f"Модель: {model}\nURL: {url}\n\n"
+                "Проверь точное имя модели. Если у неё есть лицензия/гейтинг — открой её страницу и прими условия "
+                "под тем аккаунтом, на который выписан HF_TOKEN."
+            )
+            return
+        if resp.status_code == 403:
+            message.reply_text("❌ Hugging Face 403 (нет доступа). Проверь токен и доступ к модели.")
+            return
+        if resp.status_code == 503:
+            message.reply_text("ℹ️ Модель просыпается (503). Повтори запрос через 15–30 секунд.")
+            return
+
+        message.reply_text(f"❌ Hugging Face {resp.status_code}\n{body}")
 
     except Exception:
         traceback.print_exc()
