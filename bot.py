@@ -10,24 +10,24 @@ from io import BytesIO
 import logging
 import signal
 
-# -------- ЛОГИ --------
+# ---------- ЛОГИ ----------
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bot")
 
-# -------- ОКРУЖЕНИЕ --------
+# ---------- ОКРУЖЕНИЕ ----------
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID_STR = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 
-# Текст (OpenRouter)
+# OpenRouter (текст)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OR_TEXT_MODEL = os.getenv("OR_TEXT_MODEL", "openai/gpt-oss-120b")
+OR_MODEL = os.getenv("OR_TEXT_MODEL", "openai/gpt-oss-120b")
 
-# Картинки (Hugging Face)
+# Hugging Face (картинки)
 HF_TOKEN = os.getenv("HF_TOKEN")
-HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "prompthero/openjourney")  # <- по умолчанию openjourney
+HF_IMAGE_MODEL = "runwayml/stable-diffusion-v1-5"  # ✅ рабочая модель
 
 missing = [k for k, v in {
     "BOT_TOKEN": BOT_TOKEN,
@@ -46,7 +46,7 @@ except Exception:
     log.error("❌ API_ID должен быть числом, получено: %r", API_ID_STR)
     sys.exit(1)
 
-# -------- УТИЛИТЫ --------
+# ---------- УТИЛИТЫ ----------
 def or_headers(title: str = "TelegramBot"):
     return {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -56,26 +56,26 @@ def or_headers(title: str = "TelegramBot"):
         "X-Title": title,
     }
 
-# -------- ПАМЯТЬ ДИАЛОГА --------
+# ---------- ПАМЯТЬ ДИАЛОГА ----------
 chat_history = defaultdict(list)
 HISTORY_LIMIT = 10
 
 def clamp_history(history):
     return history[-HISTORY_LIMIT:] if len(history) > HISTORY_LIMIT else history
 
-# -------- PYROGRAM --------
+# ---------- PYROGRAM ----------
 app = Client("my_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
-# -------- КОМАНДЫ --------
+# ---------- КОМАНДЫ ----------
 @app.on_message(filters.command("start"))
 def start_handler(_, message):
     uid = message.from_user.id
     chat_history[uid] = []
     message.reply_text(
-        "Привет! Я бот с памятью и генерацией картинок 🤖\n"
-        "— Просто пиши, я учитываю последние 10 реплик.\n"
-        "— Картинка: /img кот в космосе\n"
-        "— Сбросить контекст: /reset"
+        "Привет! Я бот с памятью 🤖\n"
+        "— Пиши сообщения: я учитываю контекст последних 10 реплик.\n"
+        "— Сгенерировать картинку: /img кот в космосе\n"
+        "— Очистить память: /reset"
     )
 
 @app.on_message(filters.command("reset"))
@@ -84,7 +84,7 @@ def reset_handler(_, message):
     chat_history[uid] = []
     message.reply_text("🧹 Память очищена!")
 
-# -------- ТЕКСТ (OpenRouter) --------
+# ---------- ТЕКСТ С ПАМЯТЬЮ (OpenRouter) ----------
 @app.on_message(filters.text & ~filters.command(["start", "reset", "img"]))
 def text_handler(_, message):
     uid = message.from_user.id
@@ -95,7 +95,7 @@ def text_handler(_, message):
 
     try:
         payload = {
-            "model": OR_TEXT_MODEL,
+            "model": OR_MODEL,
             "messages": [
                 {"role": "system", "content": "Ты — дружелюбный Telegram-бот. Отвечай кратко и по делу."},
                 *chat_history[uid],
@@ -111,7 +111,6 @@ def text_handler(_, message):
         )
 
         log.info("TEXT %s | %s", resp.status_code, resp.headers.get("content-type", ""))
-
         if resp.status_code != 200:
             snippet = (resp.text or "")[:600]
             message.reply_text(f"❌ OpenRouter {resp.status_code}\n{snippet}")
@@ -129,7 +128,7 @@ def text_handler(_, message):
         traceback.print_exc()
         message.reply_text("Произошла ошибка при общении с OpenRouter 🤖")
 
-# -------- КАРТИНКИ (Hugging Face: prompthero/openjourney) --------
+# ---------- КАРТИНКИ /img (Hugging Face Inference API) ----------
 @app.on_message(filters.command("img"))
 def image_handler(_, message):
     prompt = " ".join(message.command[1:]).strip()
@@ -138,8 +137,6 @@ def image_handler(_, message):
         return
 
     try:
-        # Для открытой отличной модели openjourney:
-        # https://huggingface.co/prompthero/openjourney
         url = f"https://api-inference.huggingface.co/models/{HF_IMAGE_MODEL}"
         headers = {
             "Authorization": f"Bearer {HF_TOKEN}",
@@ -147,31 +144,27 @@ def image_handler(_, message):
         }
         payload = {
             "inputs": prompt,
-            "options": {
-                "wait_for_model": True  # дождаться прогрева
-            }
+            "options": {"wait_for_model": True}
         }
 
         resp = requests.post(url, headers=headers, json=payload, timeout=180)
         ct = resp.headers.get("content-type", "")
-        log.info("IMG %s | %s | model=%s", resp.status_code, ct, HF_IMAGE_MODEL)
+        log.info("IMG %s | %s", resp.status_code, ct)
 
-        # Успех — отдали картинку
         if resp.status_code == 200 and ct.startswith("image/"):
             bio = BytesIO(resp.content)
             bio.name = "image.png"
             message.reply_photo(bio, caption=f"🎨 По запросу: {prompt}")
             return
 
-        # Если пришёл JSON/текст — покажем фрагмент для диагностики
         snippet = (resp.text or "")[:800]
-        message.reply_text(f"❌ Hugging Face {resp.status_code}\nМодель: {HF_IMAGE_MODEL}\nURL: {url}\n\n{snippet}")
+        message.reply_text(f"❌ Hugging Face {resp.status_code}\n{snippet}")
 
     except Exception:
         traceback.print_exc()
         message.reply_text("Ошибка при генерации изображения 🎨")
 
-# -------- ГРАЦИОЗНОЕ ЗАВЕРШЕНИЕ --------
+# ---------- ГРАЦИОЗНОЕ ЗАВЕРШЕНИЕ ----------
 def _graceful_exit(sig, frame):
     logging.getLogger().info("Stop signal received (%s). Exiting...", sig)
     try:
@@ -182,7 +175,7 @@ def _graceful_exit(sig, frame):
 signal.signal(signal.SIGTERM, _graceful_exit)
 signal.signal(signal.SIGINT, _graceful_exit)
 
-# -------- ЗАПУСК --------
+# ---------- ЗАПУСК ----------
 if __name__ == "__main__":
     try:
         log.info("✅ Бот запускается...")
@@ -190,6 +183,7 @@ if __name__ == "__main__":
     except Exception:
         traceback.print_exc()
         sys.exit(1)
+
 
 
 
