@@ -1,3 +1,4 @@
+# bot.py
 from pyrogram import Client, filters
 from dotenv import load_dotenv
 import os
@@ -5,34 +6,35 @@ import sys
 import requests
 import traceback
 from collections import defaultdict
-import base64
 from io import BytesIO
 import logging
 import signal
 
 # ---------- ЛОГИ ----------
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bot")
 
 # ---------- ОКРУЖЕНИЕ ----------
 load_dotenv()
 
-BOT_TOKEN          = os.getenv("BOT_TOKEN")
-API_ID_STR         = os.getenv("API_ID")
-API_HASH           = os.getenv("API_HASH")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-STABILITY_API_KEY  = os.getenv("STABILITY_API_KEY")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID_STR = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
 
-# безопасный диагностический вывод (только префикс и длина — можно потом удалить)
-log.info("OR key: %s... (len=%d)", (OPENROUTER_API_KEY or "")[:10], len(OPENROUTER_API_KEY or 0))
-log.info("SDXL key: %s... (len=%d)", (STABILITY_API_KEY  or "")[:10], len(STABILITY_API_KEY  or 0))
+# OpenRouter (текст)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OR_MODEL = os.getenv("OR_TEXT_MODEL", "openai/gpt-oss-120b")
+
+# Hugging Face (картинки)
+HF_TOKEN = os.getenv("HF_TOKEN")
+HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "runwayml/stable-diffusion-v1-5")
 
 missing = [k for k, v in {
     "BOT_TOKEN": BOT_TOKEN,
     "API_ID": API_ID_STR,
     "API_HASH": API_HASH,
     "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
-    "STABILITY_API_KEY": STABILITY_API_KEY,
+    "HF_TOKEN": HF_TOKEN,  # обязателен для /img
 }.items() if not v]
 if missing:
     log.error("❌ Не заданы переменные окружения: %s", ", ".join(missing))
@@ -44,13 +46,7 @@ except Exception:
     log.error("❌ API_ID должен быть числом, получено: %r", API_ID_STR)
     sys.exit(1)
 
-# ---------- ПАМЯТЬ ДИАЛОГА ----------
-chat_history = defaultdict(list)
-HISTORY_LIMIT = 10
-
-def clamp_history(history):
-    return history[-HISTORY_LIMIT:] if len(history) > HISTORY_LIMIT else history
-
+# ---------- УТИЛИТЫ ----------
 def or_headers(title: str = "TelegramBot"):
     return {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -60,11 +56,12 @@ def or_headers(title: str = "TelegramBot"):
         "X-Title": title,
     }
 
-# ---------- SIGTERM ----------
-def _graceful_shutdown(*_):
-    log.info("🛑 Получен SIGTERM — завершаюсь.")
-    sys.exit(0)
-signal.signal(signal.SIGTERM, _graceful_shutdown)
+# ---------- ПАМЯТЬ ДИАЛОГА ----------
+chat_history = defaultdict(list)
+HISTORY_LIMIT = 10
+
+def clamp_history(history):
+    return history[-HISTORY_LIMIT:] if len(history) > HISTORY_LIMIT else history
 
 # ---------- PYROGRAM ----------
 app = Client("my_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
@@ -75,9 +72,9 @@ def start_handler(_, message):
     uid = message.from_user.id
     chat_history[uid] = []
     message.reply_text(
-        "Привет! Я бот с памятью и генерацией картинок 🤖\n"
-        "— Просто пиши: я учитываю последние 10 реплик.\n"
-        "— Картинка: /img кот в космосе, неон, 4k\n"
+        "Привет! Я бот с памятью 🤖\n"
+        "— Пиши сообщения: я учитываю контекст последних 10 реплик.\n"
+        "— Сгенерировать картинку: /img кот в космосе\n"
         "— Очистить память: /reset"
     )
 
@@ -87,7 +84,7 @@ def reset_handler(_, message):
     chat_history[uid] = []
     message.reply_text("🧹 Память очищена!")
 
-# ---------- ТЕКСТ (OpenRouter) ----------
+# ---------- ТЕКСТ С ПАМЯТЬЮ (OpenRouter) ----------
 @app.on_message(filters.text & ~filters.command(["start", "reset", "img"]))
 def text_handler(_, message):
     uid = message.from_user.id
@@ -98,7 +95,7 @@ def text_handler(_, message):
 
     try:
         payload = {
-            "model": "openai/gpt-oss-120b",  # бесплатная текстовая модель
+            "model": OR_MODEL,
             "messages": [
                 {"role": "system", "content": "Ты — дружелюбный Telegram-бот. Отвечай кратко и по делу."},
                 *chat_history[uid],
@@ -113,9 +110,11 @@ def text_handler(_, message):
             allow_redirects=False
         )
 
-        log.info("TEXT %s | %s", resp.status_code, resp.headers.get("content-type"))
+        log.info("TEXT %s | %s", resp.status_code, resp.headers.get("content-type", ""))
         if resp.status_code != 200:
-            message.reply_text(f"❌ OpenRouter {resp.status_code}:\n{resp.text[:500]}")
+            # иногда OpenRouter может вернуть HTML/редирект — покажем небольшой фрагмент
+            snippet = (resp.text or "")[:600]
+            message.reply_text(f"❌ OpenRouter {resp.status_code}\n{snippet}")
             return
 
         data = resp.json()
@@ -130,7 +129,7 @@ def text_handler(_, message):
         traceback.print_exc()
         message.reply_text("Произошла ошибка при общении с OpenRouter 🤖")
 
-# ---------- КАРТИНКИ (Stability SDXL) ----------
+# ---------- КАРТИНКИ /img (Hugging Face Inference API) ----------
 @app.on_message(filters.command("img"))
 def image_handler(_, message):
     prompt = " ".join(message.command[1:]).strip()
@@ -139,43 +138,45 @@ def image_handler(_, message):
         return
 
     try:
-        url = "https://api.stability.ai/v1/generation/stable-diffusion-xl-1024-v1-0/text-to-image"
+        url = f"https://api-inference.huggingface.co/models/{HF_IMAGE_MODEL}"
         headers = {
-            "Authorization": f"Bearer {STABILITY_API_KEY}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Authorization": f"Bearer {HF_TOKEN}",
+            "Accept": "image/png"  # просим отдать PNG
         }
-        body = {
-            "text_prompts": [{"text": prompt}],
-            "cfg_scale": 7,
-            "height": 1024,
-            "width": 1024,
-            "samples": 1,
-            "steps": 30
+        payload = {
+            "inputs": prompt,
+            "options": {"wait_for_model": True}  # дождаться «пробуждения»
         }
 
-        resp = requests.post(url, headers=headers, json=body, timeout=120)
-        log.info("SDXL %s | %s", resp.status_code, resp.headers.get("content-type"))
+        resp = requests.post(url, headers=headers, json=payload, timeout=180)
+        ct = resp.headers.get("content-type", "")
+        log.info("IMG %s | %s", resp.status_code, ct)
 
-        if resp.status_code != 200:
-            message.reply_text(f"❌ Stability AI {resp.status_code}:\n{resp.text[:500]}")
+        # Успех: пришёл бинарный PNG/JPEG
+        if resp.status_code == 200 and ct.startswith("image/"):
+            bio = BytesIO(resp.content)
+            bio.name = "image.png"
+            message.reply_photo(bio, caption=f"🎨 По запросу: {prompt}")
             return
 
-        data = resp.json()
-        artifact = (data.get("artifacts") or [{}])[0]
-        b64 = artifact.get("base64")
-        if not b64:
-            message.reply_text("Не удалось получить изображение из ответа Stability 😕")
-            return
-
-        img_bytes = base64.b64decode(b64)
-        bio = BytesIO(img_bytes)
-        bio.name = "image.png"
-        message.reply_photo(bio, caption=f"🎨 По запросу: {prompt}")
+        # Иначе покажем короткое тело ответа для диагностики
+        snippet = (resp.text or "")[:800]
+        message.reply_text(f"❌ Hugging Face {resp.status_code}\n{snippet}")
 
     except Exception:
         traceback.print_exc()
         message.reply_text("Ошибка при генерации изображения 🎨")
+
+# ---------- ГРАЦИОЗНОЕ ЗАВЕРШЕНИЕ ----------
+def _graceful_exit(sig, frame):
+    logging.getLogger().info("Stop signal received (%s). Exiting...", sig)
+    try:
+        app.stop()
+    finally:
+        os._exit(0)
+
+signal.signal(signal.SIGTERM, _graceful_exit)
+signal.signal(signal.SIGINT, _graceful_exit)
 
 # ---------- ЗАПУСК ----------
 if __name__ == "__main__":
@@ -185,6 +186,7 @@ if __name__ == "__main__":
     except Exception:
         traceback.print_exc()
         sys.exit(1)
+
 
 
 
