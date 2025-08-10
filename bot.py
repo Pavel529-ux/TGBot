@@ -16,23 +16,23 @@ log = logging.getLogger("bot")
 
 # ---------- ОКРУЖЕНИЕ ----------
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID_STR = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# 👇 разовый диагностический вывод (безопасный префикс и длина)
-log.info(
-    "OPENROUTER_API_KEY (начало): %s... (длина: %d)",
-    (OPENROUTER_API_KEY or "")[:10],
-    len(OPENROUTER_API_KEY or "")
-)
+BOT_TOKEN          = os.getenv("BOT_TOKEN")
+API_ID_STR         = os.getenv("API_ID")
+API_HASH           = os.getenv("API_HASH")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+STABILITY_API_KEY  = os.getenv("STABILITY_API_KEY")
+
+# безопасный диагностический вывод (только префикс и длина — можно потом удалить)
+log.info("OR key: %s... (len=%d)", (OPENROUTER_API_KEY or "")[:10], len(OPENROUTER_API_KEY or 0))
+log.info("SDXL key: %s... (len=%d)", (STABILITY_API_KEY  or "")[:10], len(STABILITY_API_KEY  or 0))
 
 missing = [k for k, v in {
     "BOT_TOKEN": BOT_TOKEN,
     "API_ID": API_ID_STR,
     "API_HASH": API_HASH,
-    "OPENROUTER_API_KEY": OPENROUTER_API_KEY
+    "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
+    "STABILITY_API_KEY": STABILITY_API_KEY,
 }.items() if not v]
 if missing:
     log.error("❌ Не заданы переменные окружения: %s", ", ".join(missing))
@@ -52,7 +52,6 @@ def clamp_history(history):
     return history[-HISTORY_LIMIT:] if len(history) > HISTORY_LIMIT else history
 
 def or_headers(title: str = "TelegramBot"):
-    # минимально нужные заголовки (JSON обязателен)
     return {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -61,9 +60,9 @@ def or_headers(title: str = "TelegramBot"):
         "X-Title": title,
     }
 
-# ---------- SIGTERM лог (чтобы понимать, кто гасит контейнер) ----------
+# ---------- SIGTERM ----------
 def _graceful_shutdown(*_):
-    log.info("🛑 Получен SIGTERM — завершаюсь (инициировано платформой).")
+    log.info("🛑 Получен SIGTERM — завершаюсь.")
     sys.exit(0)
 signal.signal(signal.SIGTERM, _graceful_shutdown)
 
@@ -76,9 +75,9 @@ def start_handler(_, message):
     uid = message.from_user.id
     chat_history[uid] = []
     message.reply_text(
-        "Привет! Я бот с памятью 🤖\n"
-        "— Пиши сообщения: я учитываю контекст последних 10 реплик.\n"
-        "— Сгенерировать картинку: /img кот в космосе\n"
+        "Привет! Я бот с памятью и генерацией картинок 🤖\n"
+        "— Просто пиши: я учитываю последние 10 реплик.\n"
+        "— Картинка: /img кот в космосе, неон, 4k\n"
         "— Очистить память: /reset"
     )
 
@@ -88,7 +87,7 @@ def reset_handler(_, message):
     chat_history[uid] = []
     message.reply_text("🧹 Память очищена!")
 
-# ---------- ТЕКСТ С ПАМЯТЬЮ ----------
+# ---------- ТЕКСТ (OpenRouter) ----------
 @app.on_message(filters.text & ~filters.command(["start", "reset", "img"]))
 def text_handler(_, message):
     uid = message.from_user.id
@@ -107,20 +106,16 @@ def text_handler(_, message):
         }
 
         resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",  # API-ветка
+            "https://openrouter.ai/api/v1/chat/completions",
             headers=or_headers("TelegramBotWithMemory"),
             json=payload,
             timeout=60,
             allow_redirects=False
         )
 
-        log.info("TEXT STATUS: %s", resp.status_code)
-        log.info("TEXT URL: %s", resp.url)
-        log.info("TEXT CT: %s", resp.headers.get("content-type"))
-        log.info("TEXT RESP: %s", resp.text[:600])
-
+        log.info("TEXT %s | %s", resp.status_code, resp.headers.get("content-type"))
         if resp.status_code != 200:
-            message.reply_text(f"❌ OpenRouter (text) {resp.status_code}:\n{resp.text}")
+            message.reply_text(f"❌ OpenRouter {resp.status_code}:\n{resp.text[:500]}")
             return
 
         data = resp.json()
@@ -135,7 +130,7 @@ def text_handler(_, message):
         traceback.print_exc()
         message.reply_text("Произошла ошибка при общении с OpenRouter 🤖")
 
-# ---------- КАРТИНКИ /img ----------
+# ---------- КАРТИНКИ (Stability SDXL) ----------
 @app.on_message(filters.command("img"))
 def image_handler(_, message):
     prompt = " ".join(message.command[1:]).strip()
@@ -144,55 +139,39 @@ def image_handler(_, message):
         return
 
     try:
-        img_payload = {
-            "model": "stabilityai/stable-diffusion-xl",
-            "prompt": prompt,
-            "size": "1024x1024",
+        url = "https://api.stability.ai/v1/generation/stable-diffusion-xl-1024-v1-0/text-to-image"
+        headers = {
+            "Authorization": f"Bearer {STABILITY_API_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        body = {
+            "text_prompts": [{"text": prompt}],
+            "cfg_scale": 7,
+            "height": 1024,
+            "width": 1024,
+            "samples": 1,
+            "steps": 30
         }
 
-        resp = requests.post(
-            "https://openrouter.ai/api/v1/images/generations",  # API-ветка
-            headers=or_headers("TelegramBotImages"),
-            json=img_payload,
-            timeout=120,
-            allow_redirects=False
-        )
-
-        log.info("IMG STATUS: %s", resp.status_code)
-        log.info("IMG URL: %s", resp.url)
-        log.info("IMG CT: %s", resp.headers.get("content-type"))
-        log.info("IMG TEXT: %s", resp.text[:1000])
+        resp = requests.post(url, headers=headers, json=body, timeout=120)
+        log.info("SDXL %s | %s", resp.status_code, resp.headers.get("content-type"))
 
         if resp.status_code != 200:
-            message.reply_text(f"❌ OpenRouter (image) {resp.status_code}:\n{resp.text}")
+            message.reply_text(f"❌ Stability AI {resp.status_code}:\n{resp.text[:500]}")
             return
 
         data = resp.json()
-        item = None
-        if isinstance(data, dict) and "data" in data and data["data"]:
-            item = data["data"][0]
-
-        if not item:
-            message.reply_text("Не удалось получить данные изображения из ответа API 😕")
+        artifact = (data.get("artifacts") or [{}])[0]
+        b64 = artifact.get("base64")
+        if not b64:
+            message.reply_text("Не удалось получить изображение из ответа Stability 😕")
             return
 
-        if "url" in item and item["url"]:
-            message.reply_photo(item["url"], caption=f"🎨 По запросу: {prompt}")
-            return
-
-        if "b64_json" in item and item["b64_json"]:
-            try:
-                img_bytes = base64.b64decode(item["b64_json"])
-                bio = BytesIO(img_bytes)
-                bio.name = "image.png"
-                message.reply_photo(bio, caption=f"🎨 По запросу: {prompt}")
-                return
-            except Exception:
-                traceback.print_exc()
-                message.reply_text("Получил base64, но не смог декодировать изображение 😕")
-                return
-
-        message.reply_text("API вернул неожиданный формат данных для изображения 😕")
+        img_bytes = base64.b64decode(b64)
+        bio = BytesIO(img_bytes)
+        bio.name = "image.png"
+        message.reply_photo(bio, caption=f"🎨 По запросу: {prompt}")
 
     except Exception:
         traceback.print_exc()
@@ -202,10 +181,11 @@ def image_handler(_, message):
 if __name__ == "__main__":
     try:
         log.info("✅ Бот запускается...")
-        app.run()  # держит процесс живым
+        app.run()
     except Exception:
         traceback.print_exc()
         sys.exit(1)
+
 
 
 
