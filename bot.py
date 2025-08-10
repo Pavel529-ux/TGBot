@@ -48,6 +48,7 @@ def or_headers(title: str = "TelegramBot"):
     return {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
+        "Accept": "application/json", 
         "HTTP-Referer": "https://openrouter.ai",
         "X-Title": title,
     }
@@ -92,10 +93,11 @@ def text_handler(_, message):
         }
 
         resp = requests.post(
-            "https://openrouter.ai/v1/chat/completions",
+            "https://openrouter.ai/api/v1/chat/completions",
             headers=or_headers("TelegramBotWithMemory"),
             json=payload,
             timeout=60,
+            allow_redirects=False  
         )
 
         log.info("TEXT STATUS: %s", resp.status_code)
@@ -134,10 +136,11 @@ def image_handler(_, message):
 
         # OpenAI-совместимый image-эндпоинт у OpenRouter
         resp = requests.post(
-            "https://openrouter.ai/v1/images/generations",
+            "https://openrouter.ai/api/v1/images/generations",
             headers=or_headers("TelegramBotImages"),
             json=img_payload,
             timeout=120,
+            allow_redirects=False
         )
 
         log.info("IMG STATUS: %s", resp.status_code)
