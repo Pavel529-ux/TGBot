@@ -27,7 +27,7 @@ OR_MODEL = os.getenv("OR_TEXT_MODEL", "openai/gpt-oss-120b")
 
 # Hugging Face (картинки)
 HF_TOKEN = os.getenv("HF_TOKEN")
-HF_IMAGE_MODEL = "runwayml/stable-diffusion-v1-5"  # ✅ рабочая модель
+HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "stabilityai/sdxl-turbo")
 
 missing = [k for k, v in {
     "BOT_TOKEN": BOT_TOKEN,
