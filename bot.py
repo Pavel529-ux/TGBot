@@ -54,6 +54,12 @@ def or_headers(title: str = "TelegramBot"):
     }
 
 # ---------- PYROGRAM ----------
+import signal
+def _graceful_shutdown(*_):
+    log.info("🛑 Получен SIGTERM — завершаюсь (инициировано платформой).")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, _graceful_shutdown)
+
 app = Client("my_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
 # ---------- КОМАНДЫ ----------
