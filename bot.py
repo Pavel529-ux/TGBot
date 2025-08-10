@@ -8,6 +8,7 @@ from collections import defaultdict
 import base64
 from io import BytesIO
 import logging
+import signal
 
 # ---------- ЛОГИ ----------
 logging.basicConfig(level=logging.INFO)
@@ -19,6 +20,13 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID_STR = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+# 👇 разовый диагностический вывод (безопасный префикс и длина)
+log.info(
+    "OPENROUTER_API_KEY (начало): %s... (длина: %d)",
+    (OPENROUTER_API_KEY or "")[:10],
+    len(OPENROUTER_API_KEY or "")
+)
 
 missing = [k for k, v in {
     "BOT_TOKEN": BOT_TOKEN,
@@ -44,22 +52,22 @@ def clamp_history(history):
     return history[-HISTORY_LIMIT:] if len(history) > HISTORY_LIMIT else history
 
 def or_headers(title: str = "TelegramBot"):
-    # Минимально достаточные заголовки для OpenRouter (OpenAI-совместимый API)
+    # минимально нужные заголовки (JSON обязателен)
     return {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "Accept": "application/json", 
+        "Accept": "application/json",
         "HTTP-Referer": "https://openrouter.ai",
         "X-Title": title,
     }
 
-# ---------- PYROGRAM ----------
-import signal
+# ---------- SIGTERM лог (чтобы понимать, кто гасит контейнер) ----------
 def _graceful_shutdown(*_):
     log.info("🛑 Получен SIGTERM — завершаюсь (инициировано платформой).")
     sys.exit(0)
 signal.signal(signal.SIGTERM, _graceful_shutdown)
 
+# ---------- PYROGRAM ----------
 app = Client("my_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
 # ---------- КОМАНДЫ ----------
@@ -99,14 +107,16 @@ def text_handler(_, message):
         }
 
         resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            "https://openrouter.ai/api/v1/chat/completions",  # API-ветка
             headers=or_headers("TelegramBotWithMemory"),
             json=payload,
             timeout=60,
-            allow_redirects=False  
+            allow_redirects=False
         )
 
         log.info("TEXT STATUS: %s", resp.status_code)
+        log.info("TEXT URL: %s", resp.url)
+        log.info("TEXT CT: %s", resp.headers.get("content-type"))
         log.info("TEXT RESP: %s", resp.text[:600])
 
         if resp.status_code != 200:
@@ -140,9 +150,8 @@ def image_handler(_, message):
             "size": "1024x1024",
         }
 
-        # OpenAI-совместимый image-эндпоинт у OpenRouter
         resp = requests.post(
-            "https://openrouter.ai/api/v1/images/generations",
+            "https://openrouter.ai/api/v1/images/generations",  # API-ветка
             headers=or_headers("TelegramBotImages"),
             json=img_payload,
             timeout=120,
@@ -150,6 +159,8 @@ def image_handler(_, message):
         )
 
         log.info("IMG STATUS: %s", resp.status_code)
+        log.info("IMG URL: %s", resp.url)
+        log.info("IMG CT: %s", resp.headers.get("content-type"))
         log.info("IMG TEXT: %s", resp.text[:1000])
 
         if resp.status_code != 200:
@@ -191,11 +202,11 @@ def image_handler(_, message):
 if __name__ == "__main__":
     try:
         log.info("✅ Бот запускается...")
-        app.run()  # блокирует поток и держит контейнер живым
+        app.run()  # держит процесс живым
     except Exception:
         traceback.print_exc()
-        # Если что-то пошло не так, не гасим контейнер молча
         sys.exit(1)
+
 
 
 
