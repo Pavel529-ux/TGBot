@@ -27,16 +27,16 @@ from datetime import datetime, timedelta
 # HF_TOKEN
 #
 # ДЛЯ КАТАЛОГА (1С/файл/URL):
-# CATALOG_URL              (напр. https://example.com/1c/catalog.json)
-# CATALOG_AUTH_USER        (если нужна базовая авторизация, иначе пусто)
+# CATALOG_URL
+# CATALOG_AUTH_USER
 # CATALOG_AUTH_PASS
-# CATALOG_REFRESH_MIN=30   (как часто обновлять кэш, мин)
-# TELEGRAM_ADMIN_ID        (для /sync1c)
-# MANAGER_CHAT_ID          (куда слать заявки на бронь)
+# CATALOG_REFRESH_MIN=30
+# TELEGRAM_ADMIN_ID
+# MANAGER_CHAT_ID
 #
 # ОПЦИОНАЛЬНО:
-# OR_TEXT_MODEL            (модель OpenRouter для текста)
-# HF_IMAGE_MODEL           (id модели HF для /img; дефолт ниже)
+# OR_TEXT_MODEL
+# HF_IMAGE_MODEL
 # ==========================
 
 # ---------- ЛОГИ ----------
@@ -56,7 +56,7 @@ OR_MODEL = os.getenv("OR_TEXT_MODEL", "openai/gpt-oss-120b")
 
 # Картинки (Hugging Face)
 HF_TOKEN = os.getenv("HF_TOKEN")
-HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "stabilityai/sdxl-turbo")  # быстрый SDXL; можно менять через env
+HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "stabilityai/sdxl-turbo")
 
 # Каталог / 1С
 CATALOG_URL = os.getenv("CATALOG_URL")
@@ -94,18 +94,17 @@ def or_headers(title: str = "TelegramBot"):
     }
 
 def has_cyrillic(text: str) -> bool:
-    return bool(re.search(r"[\u0400-\u04FF]", text))
+    return bool(re.search(r"[\u0400-\u04FF]", text or ""))
 
 def translate_to_english(text: str) -> str:
-    """Перевод RU → EN через OpenRouter. Возвращает только перевод."""
+    """RU → EN через OpenRouter. Возвращает только перевод."""
     try:
         payload = {
             "model": OR_MODEL,
             "messages": [
                 {"role": "system", "content": (
-                    "You are a precise translator. "
-                    "Translate the user prompt from Russian to concise English. "
-                    "Return ONLY the translated text, no explanations."
+                    "You are a precise translator. Translate the user prompt "
+                    "from Russian to concise English. Return ONLY the translated text."
                 )},
                 {"role": "user", "content": text}
             ],
@@ -120,7 +119,7 @@ def translate_to_english(text: str) -> str:
         )
         if r.status_code == 200 and r.headers.get("content-type","").startswith("application/json"):
             return r.json()["choices"][0]["message"]["content"].strip()
-        log.warning("Translate: %s | %s", r.status_code, r.text[:300])
+        log.warning("Translate HTTP %s | %s", r.status_code, r.text[:300])
     except Exception:
         traceback.print_exc()
     return text  # fallback
@@ -137,6 +136,8 @@ def boost_prompt(en_prompt: str, user_negative: str = "") -> tuple[str, str]:
     )
     neg = (base_negative + ", " + user_negative) if user_negative else base_negative
     return base_positive, neg
+
+PHONE_RE = re.compile(r"^\+?\d[\d\s\-()]{6,}$")
 
 # ---------- ПАМЯТЬ ДИАЛОГА ----------
 chat_history = defaultdict(list)
@@ -183,15 +184,18 @@ def periodic_refresh():
     try:
         fetch_catalog(force=False)
     finally:
+        # единичный таймер; при рестарте процесса создаётся заново
         threading.Timer(CATALOG_REFRESH_MIN * 60, periodic_refresh).start()
 
 def search_products(query, limit=10):
-    q = query.strip().lower()
+    q = (query or "").strip().lower()
     results = []
     for item in catalog:
         name = str(item.get("name","")).lower()
         sku  = str(item.get("sku","")).lower()
-        if q in name or q in sku:
+        brand = str(item.get("brand","")).lower()
+        hay = f"{name} {sku} {brand}"
+        if q in hay:
             results.append(item)
             if len(results) >= limit:
                 break
@@ -213,6 +217,8 @@ def product_keyboard(p):
     buttons = [[InlineKeyboardButton("📝 Забронировать", callback_data=f"reserve:{pid}")]]
     if p.get("category"):
         buttons.append([InlineKeyboardButton(f"📂 Категория: {p['category']}", callback_data=f"cat:{p['category']}")])
+    # подсказка поиска в инлайн-режиме
+    buttons.append([InlineKeyboardButton("🔎 Искать в чате", switch_inline_query_current_chat=p.get("sku",""))])
     return InlineKeyboardMarkup(buttons)
 
 # ---------- PYROGRAM ----------
@@ -220,23 +226,38 @@ app = Client("my_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
 
 # ---------- КОМАНДЫ / ОБРАБОТЧИКИ ----------
 
-@app.on_message(filters.command("start"))
+@app.on_message(filters.command("start") & filters.private)
 def start_handler(_, message):
     uid = message.from_user.id
     chat_history[uid] = []
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Каталог", callback_data="cat:all"),
+         InlineKeyboardButton("🔎 Поиск", switch_inline_query_current_chat="")],
+        [InlineKeyboardButton("🧹 Сбросить контекст", callback_data="reset_ctx")]
+    ])
     message.reply_text(
         "Привет! Я бот магазина электрооборудования ⚡\n"
         "— Диалог с памятью\n"
         "— Картинки: /img <описание>  (поддерживает  --no ...)\n"
         "— Каталог: /catalog, поиск: /find <запрос>\n"
-        "— Очистить контекст: /reset"
+        "— Очистить контекст: /reset",
+        reply_markup=kb
     )
 
-@app.on_message(filters.command("reset"))
-def reset_handler(_, message):
-    uid = message.from_user.id
-    chat_history[uid] = []
-    message.reply_text("🧹 Память очищена!")
+@app.on_message(filters.command("help") & filters.private)
+def help_handler(_, message):
+    message.reply_text(
+        "Команды:\n"
+        "• /catalog — показать позиции\n"
+        "• /find <запрос> — поиск по названию/SKU/бренду\n"
+        "• /img <описание> --no <исключить> — сгенерировать картинку\n"
+        "• /reset — очистить контекст\n"
+        "• /ping — проверить доступность\n"
+    )
+
+@app.on_message(filters.command("ping"))
+def ping_handler(_, message):
+    message.reply_text("pong ✅")
 
 # ----- КАТАЛОГ -----
 @app.on_message(filters.command("catalog"))
@@ -316,11 +337,20 @@ def inline_query_handler(client, inline_query):
                     id=str(idx)
                 )
             )
-    inline_query.answer(items, cache_time=5, is_personal=True)
+    try:
+        inline_query.answer(items, cache_time=5, is_personal=True)
+    except Exception:
+        traceback.print_exc()
 
 @app.on_callback_query()
 def callbacks_handler(client, cq):
     data = cq.data or ""
+    if data == "reset_ctx":
+        chat_history[cq.from_user.id] = []
+        cq.answer("Контекст очищён")
+        cq.message.reply_text("Контекст очищён. /start")
+        return
+
     if data.startswith("reserve:"):
         pid = data.split(":",1)[1]
         pending_reserve[cq.from_user.id] = pid
@@ -328,7 +358,7 @@ def callbacks_handler(client, cq):
         cq.answer()
     elif data.startswith("cat:"):
         cat = data.split(":",1)[1].strip().lower()
-        items = [p for p in catalog if str(p.get("category","")).lower() == cat]
+        items = [p for p in catalog if cat in ("all", str(p.get("category","")).lower())]
         if not items:
             cq.message.reply_text("В этой категории пока пусто.")
             cq.answer()
@@ -352,12 +382,16 @@ def sync1c_handler(_, message):
     message.reply_text("✅ Каталог обновлён" if ok else "❌ Не удалось обновить каталог, проверь логи.")
 
 # ----- СБОР ТЕЛЕФОНА ДЛЯ БРОНИ -----
-@app.on_message(filters.text & ~filters.command(["start","reset","img","catalog","find","sync1c"]))
+@app.on_message(filters.text & ~filters.command(["start","reset","img","catalog","find","sync1c","help","ping"]))
 def maybe_collect_phone(_, message):
     uid = message.from_user.id
     if uid in pending_reserve:
-        pid = pending_reserve.pop(uid)
-        phone = message.text.strip()
+        pid = pending_reserve.get(uid)
+        phone = (message.text or "").strip()
+
+        if not PHONE_RE.match(phone):
+            message.reply_text("Похоже, номер не распознан. Пример: +7 999 123-45-67\nОтправьте номер ещё раз.")
+            return
 
         # найдём товар по pid
         product = None
@@ -375,6 +409,8 @@ def maybe_collect_phone(_, message):
             f"Цена: {product.get('price','—') if product else '—'} ₽"
         )
 
+        pending_reserve.pop(uid, None)
+
         if MANAGER_CHAT_ID:
             try:
                 _.send_message(MANAGER_CHAT_ID, text)
@@ -382,13 +418,12 @@ def maybe_collect_phone(_, message):
                 traceback.print_exc()
 
         message.reply_text("Спасибо! Менеджер скоро свяжется для подтверждения 😊")
-        return  # важно — не пускаем дальше в AI-диалог
+        return  # не пускаем дальше
 
 # ----- КАРТИНКИ /img (HF Inference API + перевод + буст) -----
 @app.on_message(filters.command("img"))
 def image_handler(_, message):
     """
-    Поддержка:
     /img кот в космосе --no текст, подписи
     """
     raw = " ".join(message.command[1:]).strip()
@@ -414,7 +449,7 @@ def image_handler(_, message):
     pos_prompt, neg_prompt = boost_prompt(prompt_en, user_negative=user_neg)
 
     try:
-        model = HF_IMAGE_MODEL.strip()
+        model = (HF_IMAGE_MODEL or "stabilityai/sdxl-turbo").strip()
         url = f"https://api-inference.huggingface.co/models/{model}"
         headers = {
             "Authorization": f"Bearer {HF_TOKEN}",
@@ -442,7 +477,12 @@ def image_handler(_, message):
             message.reply_photo(bio, caption=f"🎨 По запросу: {shown_prompt}")
             return
 
-        snippet = (resp.text or "")[:800]
+        # дружелюбные сообщения по частым кодам
+        if resp.status_code in (429, 503):
+            message.reply_text("Модель занята или лимит. Попробуйте ещё раз через минуту ⏳")
+            return
+
+        snippet = (getattr(resp, "text", "") or "")[:800]
         message.reply_text(
             "❌ Hugging Face {code}\nМодель: {model}\nURL: {url}\n\n{snippet}".format(
                 code=resp.status_code, model=model, url=url, snippet=snippet
@@ -454,11 +494,29 @@ def image_handler(_, message):
         message.reply_text("Ошибка при генерации изображения 🎨")
 
 # ----- ТЕКСТОВЫЙ ДИАЛОГ С ПАМЯТЬЮ (OpenRouter) -----
-@app.on_message(filters.text & ~filters.command(["start", "reset", "img", "catalog", "find", "sync1c"]))
+@app.on_message(filters.text & ~filters.command([
+    "start","reset","img","catalog","find","sync1c","help","ping"
+]))
 def text_handler(_, message):
     uid = message.from_user.id
-    user_text = message.text
+    user_text = (message.text or "").strip()
 
+    # быстрые ответы на приветствия/ключевые фразы
+    low = user_text.lower()
+    if re.search(r"\b(привет|здравствуй|здравствуйте|добрый день|hi|hello)\b", low):
+        message.reply_text("Привет! Чем помочь: каталог (/catalog) или поиск (/find <запрос>)?")
+        return
+    if "кабель" in low:
+        message.reply_text("Ищешь кабель? Пример запроса: `/find кабель 35 мм`", quote=True)
+        return
+    if "пускател" in low:
+        message.reply_text("По пускателям — `/find пускатель 95А 220В` или `/find пускатель 250А`", quote=True)
+        return
+    if "автомат" in low or re.search(r"\b\d{2,3}\s?а\b", low):
+        message.reply_text("Нужен автомат? Попробуй: `/find автомат 400А` или `/find автомат 630А ABB`", quote=True)
+        return
+
+    # диалог с памятью (OpenRouter)
     chat_history[uid].append({"role": "user", "content": user_text})
     chat_history[uid] = clamp_history(chat_history[uid])
 
@@ -466,7 +524,7 @@ def text_handler(_, message):
         payload = {
             "model": OR_MODEL,
             "messages": [
-                {"role": "system", "content": "Ты — дружелюбный Telegram-бот. Отвечай кратко и по делу."},
+                {"role": "system", "content": "Ты — дружелюбный Telegram-бот магазина электрооборудования. Отвечай кратко и по делу."},
                 *chat_history[uid],
             ],
         }
@@ -481,17 +539,18 @@ def text_handler(_, message):
 
         log.info("TEXT %s | %s", resp.status_code, resp.headers.get("content-type", ""))
         if resp.status_code != 200:
-            snippet = (resp.text or "")[:600]
-            message.reply_text(f"❌ OpenRouter {resp.status_code}\n{snippet}")
+            txt = (getattr(resp, "text", "") or "")[:600]
+            message.reply_text(f"❌ OpenRouter {resp.status_code}\n{txt}")
             return
 
         data = resp.json()
-        bot_reply = data["choices"][0]["message"]["content"].strip()
+        bot_reply = data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+        bot_reply = bot_reply.strip() or "🤖 (пустой ответ)"
 
         chat_history[uid].append({"role": "assistant", "content": bot_reply})
         chat_history[uid] = clamp_history(chat_history[uid])
 
-        message.reply_text(bot_reply or "🤖 (пустой ответ)")
+        message.reply_text(bot_reply)
 
     except Exception:
         traceback.print_exc()
@@ -521,6 +580,7 @@ if __name__ == "__main__":
     except Exception:
         traceback.print_exc()
         sys.exit(1)
+
 
 
 
