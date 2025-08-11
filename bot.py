@@ -86,22 +86,21 @@ chat_history = defaultdict(list)
 HISTORY_LIMIT = 10
 def clamp_history(h): return h[-HISTORY_LIMIT:] if len(h) > HISTORY_LIMIT else h
 
-# ========================== Каталог (память/кэш) ==========================
+# ========================== Каталог (кэш) ==========================
 catalog = []
 catalog_last_fetch = None
 catalog_lock = threading.Lock()
-pending_reserve = {}  # user_id -> product_id (ожидание телефона)
+pending_reserve = {}  # user_id -> product_id
 
-# ---------- Общие помощники по каталогу ----------
+# ---- карточки/кнопки ----
 def product_caption(p):
-    price = p.get("price")
-    stock = p.get("stock")
-    lines = [
+    price = p.get("price"); stock = p.get("stock")
+    return "\n".join([
         f"🛒 {p.get('name','')}",
         f"Артикул: {p.get('sku','—')}",
         f"Цена: {price} ₽" if price is not None else "Цена: уточняйте",
         f"В наличии: {stock} шт." if stock is not None else "Наличие: уточняйте",
-    ]; return "\n".join(lines)
+    ])
 
 def product_keyboard(p):
     pid = p.get("id") or p.get("sku")
@@ -112,49 +111,44 @@ def product_keyboard(p):
     return InlineKeyboardMarkup(btns)
 
 def send_product_message(message, p):
-    img, caption, kb = p.get("image_url"), product_caption(p), product_keyboard(p)
+    img = p.get("image_url"); caption = product_caption(p); kb = product_keyboard(p)
     if img: message.reply_photo(img, caption=caption, reply_markup=kb)
     else:   message.reply_text(caption, reply_markup=kb)
 
-# ---------- Поиск ----------
-def search_products(query, limit=10):
-    q = (query or "").strip().lower()
-    res = []
-    for it in catalog:
-        hay = f"{str(it.get('name','')).lower()} {str(it.get('sku','')).lower()} {str(it.get('brand','')).lower()}"
-        if q in hay:
-            res.append(it)
-            if len(res) >= limit: break
-    return res
-
+# ---- поиск/намерение ----
 INTENT = re.compile(
     r"(?P<what>кабель|провод|автомат|выключател[ьяь]|пускател[ьяи])?"
     r".*?(?P<num>\d{1,3})\s*(?P<unit>мм2|мм²|мм|sqmm|а|a)?",
     re.IGNORECASE
 )
 def parse_intent(text: str):
-    t = (text or "").lower()
-    brand = None
+    t = (text or "").lower(); brand=None
     for b in ("abb","schneider","iek","legrand","hager","siemens","rexant","sevkabel"):
-        if b in t: brand = b; break
-    m = INTENT.search(t); itype=sqmm=amp=None
+        if b in t: brand=b; break
+    itype=sqmm=amp=None; m=INTENT.search(t)
     if m:
-        what = (m.group("what") or ""); unit=(m.group("unit") or "").lower()
-        try: n = int(m.group("num"))
+        what=(m.group("what") or ""); unit=(m.group("unit") or "").lower()
+        try: n=int(m.group("num"))
         except: n=None
         if what.startswith("кабель") or "провод" in what: itype="кабель"
         elif what.startswith("автомат") or "выключател" in what: itype="автомат"
         elif "пускател" in what: itype="пускатель"
         if n is not None:
-            if unit in ("мм2","мм²","мм","sqmm"):
-                sqmm=n; itype=itype or "кабель"
-            elif unit in ("а","a"):
-                amp=n; itype=itype or "автомат"
+            if unit in ("мм2","мм²","мм","sqmm"): sqmm=n; itype=itype or "кабель"
+            elif unit in ("а","a"): amp=n; itype=itype or "автомат"
     return {"type": itype, "sqmm": sqmm, "amp": amp, "brand": brand}
 
+def search_products(q, limit=10):
+    q=(q or "").strip().lower(); res=[]
+    for it in catalog:
+        hay=f"{str(it.get('name','')).lower()} {str(it.get('sku','')).lower()} {str(it.get('brand','')).lower()}"
+        if q in hay:
+            res.append(it)
+            if len(res)>=limit: break
+    return res
+
 def search_products_smart(qtext: str, limit=10):
-    intent = parse_intent(qtext); q=(qtext or "").strip().lower()
-    scored=[]
+    intent=parse_intent(qtext); q=(qtext or "").strip().lower(); scored=[]
     for p in catalog:
         name=str(p.get("name","")).lower(); sku=str(p.get("sku","")).lower()
         brand=str(p.get("brand","")).lower(); ptype=str(p.get("type","")).lower()
@@ -163,20 +157,20 @@ def search_products_smart(qtext: str, limit=10):
             if intent["type"] not in ptype: continue
             score+=2
         if intent["amp"] and isinstance(amp,(int,float)):
-            score += 3 if amp==intent["amp"] else (2 if abs(amp-intent["amp"])<=10 else 0)
+            score+=3 if amp==intent["amp"] else (2 if abs(amp-intent["amp"])<=10 else 0)
         if intent["sqmm"] and isinstance(sq,(int,float)):
-            score += 3 if sq==intent["sqmm"] else (2 if abs(sq-intent["sqmm"])<=5 else 0)
+            score+=3 if sq==intent["sqmm"] else (2 if abs(sq-intent["sqmm"])<=5 else 0)
         if intent["brand"] and intent["brand"] in brand: score+=2
         if q and q in f"{name} {sku} {brand} {ptype}": score+=1
         if score>0: scored.append((score,p))
     if not scored: return search_products(qtext, limit=limit)
-    scored.sort(key=lambda x: x[0], reverse=True)
+    scored.sort(key=lambda x:x[0], reverse=True)
     return [p for _,p in scored[:limit]]
 
 def suggest_alternatives(intent, limit=6):
     if not intent["type"]: return []
     key="amp" if intent["type"] in ("автомат","пускатель") else "sqmm"
-    target = intent["amp"] if key=="amp" else intent["sqmm"]
+    target=intent["amp"] if key=="amp" else intent["sqmm"]
     if not target: return []
     al=[]
     for p in catalog:
@@ -185,9 +179,59 @@ def suggest_alternatives(intent, limit=6):
         if isinstance(val,(int,float)): al.append((abs(val-target), p))
     al.sort(key=lambda x:x[0]); return [p for _,p in al[:limit]]
 
-# ========================== CommerceML (Tilda) ==========================
+# ========================== Загрузчики каталогов ==========================
+def parse_tilda_yml(xml_bytes: bytes) -> list[dict]:
+    """
+    Парсер YML (Яндекс.Маркет) в исполнении Tilda.
+    Берём: id/vendorCode/name/vendor/category/picture/price + эвристики amp/sqmm/type.
+    """
+    root = ET.fromstring(xml_bytes)
+    # маппинг categoryId -> Название
+    cat_map = {}
+    for c in root.findall(".//categories/category"):
+        cid = c.get("id") or ""
+        name = (c.text or "").strip()
+        if cid: cat_map[cid] = name
+
+    items = []
+    for o in root.findall(".//offers/offer"):
+        sku = o.get("id") or (o.findtext("vendorCode") or "")
+        name = o.findtext("name") or ""
+        brand = o.findtext("vendor") or ""
+        price = o.findtext("price")
+        img = o.findtext("picture") or ""
+        cat_id = o.findtext("categoryId") or ""
+        category = cat_map.get(cat_id, "")
+
+        # параметры могут лежать в <param name="...">value</param>
+        text_for_parse = " ".join([
+            name,
+            " ".join([ (p.text or "") for p in o.findall("param") if p is not None ]),
+        ]).lower()
+
+        itype = "кабель" if "кабел" in text_for_parse else (
+            "автомат" if ("автомат" in text_for_parse or "выключат" in text_for_parse) else (
+                "пускатель" if "пускател" in text_for_parse else ""
+            )
+        )
+        amp = None; sqmm = None
+        m_amp = re.search(r"(\d{2,3})\s*а\b", text_for_parse)
+        if m_amp: amp = int(m_amp.group(1))
+        m_sq = re.search(r"(\d{1,3})\s*мм[²2]|\b(\d{1,3})\s*sqmm", text_for_parse)
+        if m_sq: sqmm = int([g for g in m_sq.groups() if g][0])
+
+        items.append({
+            "id": sku or name, "sku": sku or name, "name": name,
+            "type": itype, "brand": brand, "category": category,
+            "amp": amp, "sqmm": sqmm,
+            "price": float(price) if price else None,
+            "stock": None,  # в YML Tilda обычно нет остатков
+            "image_url": img
+        })
+    return items
+
 def parse_commerceml(xml_bytes: bytes) -> list[dict]:
-    """Парсер CommerceML: одиночный XML или ZIP (import.xml + offers.xml)."""
+    """Парсер CommerceML (одиночный XML или ZIP: import.xml+offers.xml)."""
     def _parse_catalog(root):
         cat={}
         for t in root.findall(".//Товары/Товар"):
@@ -198,9 +242,9 @@ def parse_commerceml(xml_bytes: bytes) -> list[dict]:
             image=(t.findtext("Картинка") or "").strip()
             catref=t.find(".//Группы/Ид"); category=(catref.text or "").strip() if catref is not None else ""
             low=f"{name} {(t.findtext('Описание') or '')}".lower()
-            itype = "кабель" if "кабел" in low else ("автомат" if ("автомат" in low or "выключат" in low) else ("пускатель" if "пускател" in low else ""))
+            itype="кабель" if "кабел" in low else ("автомат" if ("автомат" in low or "выключат" in low) else ("пускатель" if "пускател" in low else ""))
             amp=sqmm=None
-            m_amp=re.search(r"(\d{2,3})\s*а\b", low);  m_sq=re.search(r"(\d{1,3})\s*мм[²2]|\b(\d{1,3})\s*sqmm", low)
+            m_amp=re.search(r"(\d{2,3})\s*а\b", low); m_sq=re.search(r"(\d{1,3})\s*мм[²2]|\b(\d{1,3})\s*sqmm", low)
             if m_amp: amp=int(m_amp.group(1))
             if m_sq:  sqmm=int([g for g in m_sq.groups() if g][0])
             if _id:
@@ -227,15 +271,17 @@ def parse_commerceml(xml_bytes: bytes) -> list[dict]:
                 except: stock=None
             offers[_id]={"price":price,"stock":stock}
         return offers
-    def _parse_one(xml_b: bytes)->list[dict]:
+    def _one(xml_b: bytes):
         root=ET.fromstring(xml_b); cat_map=_parse_catalog(root); off_map=_parse_offers(root)
         items=[]; keys=set(cat_map.keys())|set(off_map.keys())
         for k in keys:
             base=cat_map.get(k,{}); price=off_map.get(k,{}).get("price"); stock=off_map.get(k,{}).get("stock")
-            items.append({"id":base.get("id",k),"sku":base.get("sku",k),"name":base.get("name",k),
-                          "type":base.get("type",""),"brand":base.get("brand",""),"category":base.get("category",""),
-                          "amp":base.get("amp"),"sqmm":base.get("sqmm"),"price":price,"stock":stock,
-                          "image_url":base.get("image_url","")})
+            items.append({
+                "id":base.get("id",k),"sku":base.get("sku",k),"name":base.get("name",k),
+                "type":base.get("type",""),"brand":base.get("brand",""),"category":base.get("category",""),
+                "amp":base.get("amp"),"sqmm":base.get("sqmm"),"price":price,"stock":stock,
+                "image_url":base.get("image_url","")
+            })
         return items
     if zipfile.is_zipfile(io.BytesIO(xml_bytes)):
         with zipfile.ZipFile(io.BytesIO(xml_bytes)) as z:
@@ -249,15 +295,20 @@ def parse_commerceml(xml_bytes: bytes) -> list[dict]:
             items=[]; keys=set(cat_map.keys())|set(off_map.keys())
             for k in keys:
                 base=cat_map.get(k,{}); price=off_map.get(k,{}).get("price"); stock=off_map.get(k,{}).get("stock")
-                items.append({"id":base.get("id",k),"sku":base.get("sku",k),"name":base.get("name",k),
-                              "type":base.get("type",""),"brand":base.get("brand",""),"category":base.get("category",""),
-                              "amp":base.get("amp"),"sqmm":base.get("sqmm"),"price":price,"stock":stock,
-                              "image_url":base.get("image_url","")})
+                items.append({
+                    "id":base.get("id",k),"sku":base.get("sku",k),"name":base.get("name",k),
+                    "type":base.get("type",""),"brand":base.get("brand",""),"category":base.get("category",""),
+                    "amp":base.get("amp"),"sqmm":base.get("sqmm"),"price":price,"stock":stock,
+                    "image_url":base.get("image_url","")
+                })
             return items
-    return _parse_one(xml_bytes)
+    return _one(xml_bytes)
 
 def fetch_catalog(force=False):
-    """Загружает каталог из CATALOG_URL. Поддержка: CommerceML (XML/ZIP), JSON, YML, CSV."""
+    """
+    Загружает каталог из CATALOG_URL.
+    Форматы: YML (Tilda/Я.Маркет), CommerceML (XML/ZIP), JSON, CSV.
+    """
     global catalog, catalog_last_fetch
     with catalog_lock:
         now = datetime.utcnow()
@@ -265,45 +316,51 @@ def fetch_catalog(force=False):
             return False
         if not CATALOG_URL:
             log.warning("CATALOG_URL не задан — пропускаю загрузку каталога"); return False
-        auth=(CATALOG_AUTH_USER, CATALOG_AUTH_PASS) if CATALOG_AUTH_USER else None
+
+        auth = (CATALOG_AUTH_USER, CATALOG_AUTH_PASS) if CATALOG_AUTH_USER else None
         try:
-            r=requests.get(CATALOG_URL, auth=auth, timeout=60); r.raise_for_status()
-            ct=(r.headers.get("content-type") or "").lower(); url_l=CATALOG_URL.lower()
-            items=[]
-            # CommerceML / XML / ZIP / YML
-            if "xml" in ct or "zip" in ct or url_l.endswith((".xml",".yml",".zip")):
+            r = requests.get(CATALOG_URL, auth=auth, timeout=60)
+            r.raise_for_status()
+            ct = (r.headers.get("content-type") or "").lower()
+            url_l = CATALOG_URL.lower()
+
+            items = []
+
+            # 1) Tilda YML / обычный YML
+            if "xml" in ct and url_l.endswith(".yml"):
+                try:
+                    items = parse_tilda_yml(r.content)
+                except Exception:
+                    traceback.print_exc()
+                    log.error("Не удалось разобрать YML"); return False
+
+            # 2) CommerceML (XML/ZIP) или другой XML
+            elif "xml" in ct or "zip" in ct or url_l.endswith((".xml", ".zip")):
                 try:
                     items = parse_commerceml(r.content)
                 except Exception:
+                    # как fallback: попробуем как YML
                     try:
-                        root=ET.fromstring(r.content); tmp=[]
-                        for o in root.findall(".//offer"):
-                            sku=o.get("id") or (o.findtext("vendorCode") or ""); name=o.findtext("name") or ""
-                            price=o.findtext("price"); brand=o.findtext("vendor") or ""; img=o.findtext("picture") or ""
-                            low=name.lower()
-                            itype="кабель" if "кабел" in low else ("автомат" if ("автомат" in low or "выключат" in low) else ("пускатель" if "пускател" in low else ""))
-                            amp=sqmm=None
-                            m_amp=re.search(r"(\d{2,3})\s*а\b", low); m_sq=re.search(r"(\d{1,3})\s*мм[²2]|\b(\d{1,3})\s*sqmm", low)
-                            if m_amp: amp=int(m_amp.group(1))
-                            if m_sq: sqmm=int([g for g in m_sq.groups() if g][0])
-                            tmp.append({"id":sku or name,"sku":sku,"name":name,"type":itype,"brand":brand,"category":"",
-                                        "amp":amp,"sqmm":sqmm,"price":float(price) if price else None,"stock":None,
-                                        "image_url":img})
-                        items=tmp
+                        items = parse_tilda_yml(r.content)
                     except Exception:
                         traceback.print_exc(); log.error("Не удалось разобрать XML как CommerceML/YML"); return False
+
+            # 3) JSON
             elif "application/json" in ct or url_l.endswith(".json"):
-                data=r.json()
-                if not isinstance(data,list): log.error("JSON корень не список"); return False
-                items=data
+                data = r.json()
+                if not isinstance(data, list):
+                    log.error("JSON корень не список"); return False
+                items = data
+
+            # 4) CSV
             elif "text/csv" in ct or url_l.endswith(".csv"):
-                f=io.StringIO(r.text); reader=csv.DictReader(f)
+                f = io.StringIO(r.text); reader = csv.DictReader(f)
                 for row in reader:
-                    def _i(v): 
-                        try: return int(str(v).strip().replace(" ","")) if str(v).strip() else None
+                    def _i(v):
+                        try: return int(str(v).strip().replace(" ", "")) if str(v).strip() else None
                         except: return None
                     def _f(v):
-                        try: return float(str(v).replace(",",".").strip()) if str(v).strip() else None
+                        try: return float(str(v).replace(",", ".").strip()) if str(v).strip() else None
                         except: return None
                     items.append({
                         "id": row.get("id") or row.get("sku") or row.get("ID"),
@@ -319,15 +376,17 @@ def fetch_catalog(force=False):
             else:
                 log.error("Неизвестный формат каталога: %s", ct or url_l); return False
 
-            norm=[]
+            # нормализация
+            norm = []
             for p in items:
-                if not p or not p.get("name"): continue
+                if not p or not p.get("name"): 
+                    continue
                 p.setdefault("id", p.get("sku") or p.get("name"))
                 p.setdefault("sku", p.get("id"))
                 p.setdefault("brand",""); p.setdefault("category",""); p.setdefault("type","")
                 norm.append(p)
 
-            catalog=norm; catalog_last_fetch=now
+            catalog = norm; catalog_last_fetch = now
             log.info("Каталог обновлён: %d позиций (из %s)", len(catalog), CATALOG_URL)
             return True
         except Exception as e:
@@ -430,7 +489,7 @@ def callbacks_handler(client, cq):
             except Exception: traceback.print_exc()
         cq.answer()
 
-# ---------- Sync из Tilda ----------
+# ---------- Sync ----------
 @app.on_message(filters.command("sync1c"))
 def sync1c_handler(_, message):
     if TELEGRAM_ADMIN_ID and message.from_user.id != TELEGRAM_ADMIN_ID:
@@ -438,12 +497,11 @@ def sync1c_handler(_, message):
     ok=fetch_catalog(force=True)
     message.reply_text("✅ Каталог обновлён" if ok else "❌ Не удалось обновить каталог, проверь логи.")
 
-# ---------- Сбор телефона (бронь) ----------
+# ---------- Сбор телефона ----------
 @app.on_message(filters.text & ~filters.command(["start","reset","img","catalog","find","sync1c","help","ping"]))
 def maybe_collect_phone(_, message):
     uid=message.from_user.id
     if uid in pending_reserve:
-        log.info("waiting phone from uid=%s", uid)
         pid=pending_reserve.get(uid); phone=(message.text or "").strip()
         if not PHONE_RE.match(phone):
             message.reply_text("Похоже, номер не распознан. Пример: +7 999 123-45-67\nОтправьте номер ещё раз."); return
@@ -486,15 +544,14 @@ def image_handler(_, message):
         snippet=(getattr(resp,"text","") or "")[:800]; message.reply_text(f"❌ Hugging Face {resp.status_code}\n{snippet}")
     except Exception: traceback.print_exc(); message.reply_text("Ошибка при генерации изображения 🎨")
 
-# ---------- Текст: свободный ввод → поиск → альтернативы → AI ----------
+# ---------- Текст → поиск/альтернативы/AI ----------
 @app.on_message(filters.text & ~filters.command(["start","reset","img","catalog","find","sync1c","help","ping"]), group=1)
 def text_handler(_, message):
     uid=message.from_user.id; user_text=(message.text or "").strip(); low=user_text.lower()
-    # кнопки-ярлыки
     if low in ("📦 каталог","каталог"): return show_catalog(_, message)
     if low in ("🔎 поиск","поиск"): message.reply_text("Что ищем? Пиши свободно: «кабель 35мм», «автомат 400А ABB»."); return
     if low in ("🧹 сброс","сброс"): return reset_handler(_, message)
-    # умный поиск
+
     if catalog:
         results=search_products_smart(user_text, limit=8)
         if results:
@@ -509,10 +566,10 @@ def text_handler(_, message):
                 try: send_product_message(message, p)
                 except Exception: traceback.print_exc()
             return
-    # приветствия
+
     if re.search(r"\b(привет|здравствуй|здравствуйте|добрый день|hi|hello)\b", low):
         message.reply_text("Привет! Напиши, что нужно: «кабель 35мм», «автомат 400А ABB», или жми «📦 Каталог»."); return
-    # AI fallback
+
     chat_history[uid].append({"role":"user","content":user_text}); chat_history[uid]=clamp_history(chat_history[uid])
     try:
         payload={"model":OR_MODEL,"messages":[
