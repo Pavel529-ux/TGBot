@@ -184,7 +184,6 @@ def periodic_refresh():
     try:
         fetch_catalog(force=False)
     finally:
-        # единичный таймер; при рестарте процесса создаётся заново
         threading.Timer(CATALOG_REFRESH_MIN * 60, periodic_refresh).start()
 
 def search_products(query, limit=10):
@@ -217,7 +216,6 @@ def product_keyboard(p):
     buttons = [[InlineKeyboardButton("📝 Забронировать", callback_data=f"reserve:{pid}")]]
     if p.get("category"):
         buttons.append([InlineKeyboardButton(f"📂 Категория: {p['category']}", callback_data=f"cat:{p['category']}")])
-    # подсказка поиска в инлайн-режиме
     buttons.append([InlineKeyboardButton("🔎 Искать в чате", switch_inline_query_current_chat=p.get("sku",""))])
     return InlineKeyboardMarkup(buttons)
 
@@ -386,6 +384,7 @@ def sync1c_handler(_, message):
 def maybe_collect_phone(_, message):
     uid = message.from_user.id
     if uid in pending_reserve:
+        log.info("waiting phone from uid=%s", uid)
         pid = pending_reserve.get(uid)
         phone = (message.text or "").strip()
 
@@ -477,7 +476,6 @@ def image_handler(_, message):
             message.reply_photo(bio, caption=f"🎨 По запросу: {shown_prompt}")
             return
 
-        # дружелюбные сообщения по частым кодам
         if resp.status_code in (429, 503):
             message.reply_text("Модель занята или лимит. Попробуйте ещё раз через минуту ⏳")
             return
@@ -494,14 +492,15 @@ def image_handler(_, message):
         message.reply_text("Ошибка при генерации изображения 🎨")
 
 # ----- ТЕКСТОВЫЙ ДИАЛОГ С ПАМЯТЬЮ (OpenRouter) -----
-@app.on_message(filters.text & ~filters.command([
-    "start","reset","img","catalog","find","sync1c","help","ping"
-]))
+@app.on_message(
+    filters.text & ~filters.command(["start","reset","img","catalog","find","sync1c","help","ping"]),
+    group=1  # <— запускаем ПОСЛЕ maybe_collect_phone
+)
 def text_handler(_, message):
     uid = message.from_user.id
     user_text = (message.text or "").strip()
 
-    # быстрые ответы на приветствия/ключевые фразы
+    # быстрые ответы
     low = user_text.lower()
     if re.search(r"\b(привет|здравствуй|здравствуйте|добрый день|hi|hello)\b", low):
         message.reply_text("Привет! Чем помочь: каталог (/catalog) или поиск (/find <запрос>)?")
@@ -571,7 +570,6 @@ signal.signal(signal.SIGINT, _graceful_exit)
 if __name__ == "__main__":
     try:
         log.info("✅ Бот запускается...")
-        # предварительная загрузка каталога и запуск периодического обновления
         if CATALOG_URL:
             if not fetch_catalog(force=True):
                 log.warning("Каталог не удалось загрузить на старте")
@@ -580,6 +578,7 @@ if __name__ == "__main__":
     except Exception:
         traceback.print_exc()
         sys.exit(1)
+
 
 
 
