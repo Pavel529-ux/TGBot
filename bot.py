@@ -10,7 +10,7 @@ import os, sys, re, requests, traceback, logging, signal, threading, io, csv, zi
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone  # ← timezone-aware
 
 # ========================== ENV ==========================
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -70,7 +70,8 @@ def translate_to_english(text: str) -> str:
         if r.status_code == 200 and r.headers.get("content-type","").startswith("application/json"):
             return r.json()["choices"][0]["message"]["content"].strip()
         log.warning("Translate HTTP %s | %s", r.status_code, r.text[:300])
-    except Exception: traceback.print_exc()
+    except Exception:
+        traceback.print_exc()
     return text
 
 def boost_prompt(en_prompt: str, user_negative: str = "") -> tuple[str, str]:
@@ -103,6 +104,7 @@ def product_caption(p):
     ])
 
 def product_keyboard(p):
+    from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     pid = p.get("id") or p.get("sku")
     btns = [[InlineKeyboardButton("📝 Забронировать", callback_data=f"reserve:{pid}")]]
     if p.get("category"):
@@ -182,11 +184,10 @@ def suggest_alternatives(intent, limit=6):
 # ========================== Загрузчики каталогов ==========================
 def parse_tilda_yml(xml_bytes: bytes) -> list[dict]:
     """
-    Парсер YML (Яндекс.Маркет) в исполнении Tilda.
-    Берём: id/vendorCode/name/vendor/category/picture/price + эвристики amp/sqmm/type.
+    Парсер YML (Tilda/Яндекс.Маркет)
     """
     root = ET.fromstring(xml_bytes)
-    # маппинг categoryId -> Название
+    # категории
     cat_map = {}
     for c in root.findall(".//categories/category"):
         cid = c.get("id") or ""
@@ -203,10 +204,10 @@ def parse_tilda_yml(xml_bytes: bytes) -> list[dict]:
         cat_id = o.findtext("categoryId") or ""
         category = cat_map.get(cat_id, "")
 
-        # параметры могут лежать в <param name="...">value</param>
+        # собрать текст для эвристик из name + всех param
         text_for_parse = " ".join([
             name,
-            " ".join([ (p.text or "") for p in o.findall("param") if p is not None ]),
+            " ".join([(p.text or "") for p in o.findall("param") if p is not None]),
         ]).lower()
 
         itype = "кабель" if "кабел" in text_for_parse else (
@@ -225,13 +226,13 @@ def parse_tilda_yml(xml_bytes: bytes) -> list[dict]:
             "type": itype, "brand": brand, "category": category,
             "amp": amp, "sqmm": sqmm,
             "price": float(price) if price else None,
-            "stock": None,  # в YML Tilda обычно нет остатков
+            "stock": None,  # обычно нет остатков в Tilda YML
             "image_url": img
         })
     return items
 
 def parse_commerceml(xml_bytes: bytes) -> list[dict]:
-    """Парсер CommerceML (одиночный XML или ZIP: import.xml+offers.xml)."""
+    """CommerceML: одиночный XML или ZIP (import.xml + offers.xml)."""
     def _parse_catalog(root):
         cat={}
         for t in root.findall(".//Товары/Товар"):
@@ -306,12 +307,11 @@ def parse_commerceml(xml_bytes: bytes) -> list[dict]:
 
 def fetch_catalog(force=False):
     """
-    Загружает каталог из CATALOG_URL.
-    Форматы: YML (Tilda/Я.Маркет), CommerceML (XML/ZIP), JSON, CSV.
+    Загружает каталог из CATALOG_URL: YML (Tilda/ЯМ), CommerceML (XML/ZIP), JSON, CSV.
     """
     global catalog, catalog_last_fetch
     with catalog_lock:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)  # ← timezone-aware
         if not force and catalog_last_fetch and now - catalog_last_fetch < timedelta(minutes=CATALOG_REFRESH_MIN):
             return False
         if not CATALOG_URL:
@@ -326,24 +326,16 @@ def fetch_catalog(force=False):
 
             items = []
 
-            # 1) Tilda YML / обычный YML
+            # 1) YML
             if "xml" in ct and url_l.endswith(".yml"):
-                try:
-                    items = parse_tilda_yml(r.content)
-                except Exception:
-                    traceback.print_exc()
-                    log.error("Не удалось разобрать YML"); return False
+                items = parse_tilda_yml(r.content)
 
-            # 2) CommerceML (XML/ZIP) или другой XML
+            # 2) CommerceML / XML / ZIP (с фолбэком на YML)
             elif "xml" in ct or "zip" in ct or url_l.endswith((".xml", ".zip")):
                 try:
                     items = parse_commerceml(r.content)
                 except Exception:
-                    # как fallback: попробуем как YML
-                    try:
-                        items = parse_tilda_yml(r.content)
-                    except Exception:
-                        traceback.print_exc(); log.error("Не удалось разобрать XML как CommerceML/YML"); return False
+                    items = parse_tilda_yml(r.content)
 
             # 3) JSON
             elif "application/json" in ct or url_l.endswith(".json"):
@@ -386,21 +378,30 @@ def fetch_catalog(force=False):
                 p.setdefault("brand",""); p.setdefault("category",""); p.setdefault("type","")
                 norm.append(p)
 
-            catalog = norm; catalog_last_fetch = now
+            catalog = norm
+            catalog_last_fetch = now
             log.info("Каталог обновлён: %d позиций (из %s)", len(catalog), CATALOG_URL)
             return True
         except Exception as e:
             traceback.print_exc(); log.error("Ошибка загрузки каталога: %s", e); return False
 
 def periodic_refresh():
-    try: fetch_catalog(force=False)
-    finally: threading.Timer(CATALOG_REFRESH_MIN*60, periodic_refresh).start()
+    try:
+        fetch_catalog(force=False)
+    finally:
+        threading.Timer(CATALOG_REFRESH_MIN*60, periodic_refresh).start()
 
-# ========================== Pyrogram ==========================
-app = Client("my_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH)
+# ========================== Pyrogram (in_memory session) ==========================
+app = Client(
+    "my_bot",
+    bot_token=BOT_TOKEN,
+    api_id=API_ID,
+    api_hash=API_HASH,
+    in_memory=True  # ← ключевая правка: не создаёт/не требует файловую сессию
+)
 
-# ========================== Команды / UI ==========================
-@app.on_message(filters.command("start") & filters.private)
+# ========================== Команды / UI (Только ЛИЧНЫЕ чаты) ==========================
+@app.on_message(filters.private & filters.command("start"))
 def start_handler(_, message):
     uid=message.from_user.id; chat_history[uid]=[]
     kb_inline = InlineKeyboardMarkup([
@@ -411,19 +412,19 @@ def start_handler(_, message):
     kb_main = ReplyKeyboardMarkup([[KeyboardButton("📦 Каталог"), KeyboardButton("🔎 Поиск")],
                                    [KeyboardButton("🧹 Сброс")]], resize_keyboard=True)
     message.reply_text(
-        "Привет! Я бот магазина ⚡ Пиши свободно: «кабель 35мм», «автомат 400А ABB» — подберу товары.",
+        "Привет! Я бот магазина ⚡ Пиши свободно: «кабель 35мм», «автомат 400А ABB».",
         reply_markup=kb_main
     )
     message.reply_text("Доп. меню:", reply_markup=kb_inline)
 
-@app.on_message(filters.command("help") & filters.private)
+@app.on_message(filters.private & filters.command("help"))
 def help_handler(_, message):
     message.reply_text("Пиши текстом: «кабель 35мм», «автомат 400А ABB». Кнопки внизу: Каталог / Поиск / Сброс.")
 
-@app.on_message(filters.command("ping"))
+@app.on_message(filters.private & filters.command("ping"))
 def ping_handler(_, message): message.reply_text("pong ✅")
 
-@app.on_message(filters.command("catalog"))
+@app.on_message(filters.private & filters.command("catalog"))
 def catalog_cmd(_, message): show_catalog(_, message)
 
 def show_catalog(_, message):
@@ -432,7 +433,7 @@ def show_catalog(_, message):
         try: send_product_message(message, p)
         except Exception: traceback.print_exc()
 
-@app.on_message(filters.command("find"))
+@app.on_message(filters.private & filters.command("find"))
 def find_cmd(_, message):
     query=" ".join(message.command[1:]).strip(); handle_search_text(_, message, query)
 
@@ -454,7 +455,7 @@ def handle_search_text(_, message, text):
         return
     message.reply_text("Ничего не нашлось 😕 Уточни запрос: бренд/ток/сечение.")
 
-# ---------- Inline ----------
+# ---------- Inline (оставляем; можно вызывать из лички кнопкой "Искать в чате") ----------
 @app.on_inline_query()
 def inline_query_handler(client, inline_query):
     q=inline_query.query.strip()
@@ -468,8 +469,10 @@ def inline_query_handler(client, inline_query):
             items.append(InlineQueryResultArticle(title=p.get("name","Товар"),
                 description=f"SKU: {p.get('sku','—')} | {p.get('price','—')} ₽",
                 input_message_content=InputTextMessageContent(caption), reply_markup=kb, id=str(idx)))
-    try: inline_query.answer(items, cache_time=5, is_personal=True)
-    except Exception: traceback.print_exc()
+    try:
+        inline_query.answer(items, cache_time=5, is_personal=True)
+    except Exception:
+        traceback.print_exc()
 
 # ---------- Callbacks ----------
 @app.on_callback_query()
@@ -490,7 +493,7 @@ def callbacks_handler(client, cq):
         cq.answer()
 
 # ---------- Sync ----------
-@app.on_message(filters.command("sync1c"))
+@app.on_message(filters.private & filters.command("sync1c"))
 def sync1c_handler(_, message):
     if TELEGRAM_ADMIN_ID and message.from_user.id != TELEGRAM_ADMIN_ID:
         message.reply_text("Недостаточно прав."); return
@@ -498,7 +501,7 @@ def sync1c_handler(_, message):
     message.reply_text("✅ Каталог обновлён" if ok else "❌ Не удалось обновить каталог, проверь логи.")
 
 # ---------- Сбор телефона ----------
-@app.on_message(filters.text & ~filters.command(["start","reset","img","catalog","find","sync1c","help","ping"]))
+@app.on_message(filters.private & filters.text & ~filters.command(["start","reset","img","catalog","find","sync1c","help","ping"]))
 def maybe_collect_phone(_, message):
     uid=message.from_user.id
     if uid in pending_reserve:
@@ -522,7 +525,7 @@ def maybe_collect_phone(_, message):
         return
 
 # ---------- /img ----------
-@app.on_message(filters.command("img"))
+@app.on_message(filters.private & filters.command("img"))
 def image_handler(_, message):
     raw=" ".join(message.command[1:]).strip()
     if not raw: message.reply_text("Напиши: /img кот в космосе --no текст, подписи"); return
@@ -542,10 +545,11 @@ def image_handler(_, message):
             message.reply_photo(bio, caption=f"🎨 По запросу: {prompt_src or prompt_en}"); return
         if resp.status_code in (429,503): message.reply_text("Модель занята или лимит. Попробуйте ещё раз через минуту ⏳"); return
         snippet=(getattr(resp,"text","") or "")[:800]; message.reply_text(f"❌ Hugging Face {resp.status_code}\n{snippet}")
-    except Exception: traceback.print_exc(); message.reply_text("Ошибка при генерации изображения 🎨")
+    except Exception:
+        traceback.print_exc(); message.reply_text("Ошибка при генерации изображения 🎨")
 
-# ---------- Текст → поиск/альтернативы/AI ----------
-@app.on_message(filters.text & ~filters.command(["start","reset","img","catalog","find","sync1c","help","ping"]), group=1)
+# ---------- Текст (личка) → поиск/альтернативы/AI ----------
+@app.on_message(filters.private & filters.text & ~filters.command(["start","reset","img","catalog","find","sync1c","help","ping"]), group=1)
 def text_handler(_, message):
     uid=message.from_user.id; user_text=(message.text or "").strip(); low=user_text.lower()
     if low in ("📦 каталог","каталог"): return show_catalog(_, message)
@@ -582,10 +586,11 @@ def text_handler(_, message):
         bot_reply=resp.json()["choices"][0]["message"]["content"].strip() or "🤖 (пустой ответ)"
         chat_history[uid].append({"role":"assistant","content":bot_reply}); chat_history[uid]=clamp_history(chat_history[uid])
         message.reply_text(bot_reply)
-    except Exception: traceback.print_exc(); message.reply_text("Упс, не разобрал. Пример: «кабель 35мм» или «автомат 400А ABB».")
+    except Exception:
+        traceback.print_exc(); message.reply_text("Упс, не разобрал. Пример: «кабель 35мм» или «автомат 400А ABB».")
 
 # ---------- Reset ----------
-@app.on_message(filters.command("reset"))
+@app.on_message(filters.private & filters.command("reset"))
 def reset_handler(_, message):
     chat_history[message.from_user.id]=[]; message.reply_text("🧹 Память очищена!")
 
@@ -605,7 +610,9 @@ if __name__ == "__main__":
             if not fetch_catalog(force=True): log.warning("Каталог не удалось загрузить на старте")
             periodic_refresh()
         app.run()
-    except Exception: traceback.print_exc(); sys.exit(1)
+    except Exception:
+        traceback.print_exc(); sys.exit(1)
+
 
 
 
