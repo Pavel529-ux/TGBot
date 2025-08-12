@@ -6,11 +6,14 @@ from pyrogram.types import (
     ReplyKeyboardMarkup, KeyboardButton
 )
 from dotenv import load_dotenv
-import os, sys, re, requests, traceback, logging, signal, threading, io, csv, zipfile
+import os, sys, re, requests, traceback, logging, signal, threading, io, csv, zipfile, json
 import xml.etree.ElementTree as ET
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, OrderedDict
 from io import BytesIO
-from datetime import datetime, timedelta, timezone  # timezone-aware datetimes
+from datetime import datetime, timedelta, timezone
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs, quote, unquote
+import threading as _threading
 
 # ───────────── ENV / CONFIG ─────────────
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -36,14 +39,9 @@ CATALOG_REFRESH_MIN = int(os.getenv("CATALOG_REFRESH_MIN", "30"))
 TELEGRAM_ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0"))
 MANAGER_CHAT_ID = int(os.getenv("MANAGER_CHAT_ID", "0"))
 
-# автообновление / уведомления
 AUTOSYNC_NOTIFY = os.getenv("AUTOSYNC_NOTIFY", "1") == "1"
-AUTOSYNC_REMIND_EVERY_MIN = int(os.getenv("AUTOSYNC_REMIND_EVERY_MIN", "120"))  # каждые 2 часа
+AUTOSYNC_REMIND_EVERY_MIN = int(os.getenv("AUTOSYNC_REMIND_EVERY_MIN", "120"))
 
-# http-хук для мгновенного обновления
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
-import threading as _threading
 SECRET_EXPORT_TOKEN = os.getenv("SECRET_EXPORT_TOKEN")
 HTTP_PORT = int(os.getenv("PORT", "8000"))
 
@@ -95,56 +93,47 @@ def boost_prompt(en_prompt: str, user_negative: str = "") -> tuple[str, str]:
 
 PHONE_RE = re.compile(r"^\+?\d[\d\s\-()]{6,}$")
 
+def slugify(s: str) -> str:
+    return re.sub(r"[^a-z0-9\-]+", "_", (s or "").strip().lower())
+
+def unslugify(slug: str, choices=None, fallback="Без категории") -> str:
+    if choices:
+        for c in choices:
+            if slugify(c) == slug: return c
+    for c in catalog_index.get("categories", []):
+        if slugify(c) == slug: return c
+    return fallback
+
 # ───────────── Память ─────────────
 chat_history = defaultdict(list)
 HISTORY_LIMIT = 10
 def clamp_history(h): return h[-HISTORY_LIMIT:] if len(h) > HISTORY_LIMIT else h
 
 # ───────────── Каталог / кэш ─────────────
-catalog = []
+catalog = []               # каждый товар: {id, sku, name, brand, category, image_url, price, stock, type, amp, sqmm, attrs: {Название: Значение}}
 catalog_last_fetch = None
 catalog_lock = threading.Lock()
-pending_reserve = {}  # user_id -> product_id
+pending_reserve = {}       # user_id -> product_id
 
-# индекс для категорий/фильтров
+# индексы
 catalog_index = {
-    "categories": [],  # список названий
-    "brands_by_cat": {},  # cat -> Counter брендов
+    "categories": [],
+    "brands_by_cat": {},      # cat -> Counter(brand)
+    "attrs_by_cat": {},       # cat -> {attr_name -> Counter(values)}
+    "attr_steps_by_cat": {},  # cat -> [attr_name,...] (порядок шагов мастера)
 }
-CAT_PAGE = 8        # категорий на страницу
-ITEMS_PAGE = 5      # товаров на страницу
+CAT_PAGE = 8
+ITEMS_PAGE = 5
+VALUES_PER_STEP = 8         # сколько значений атрибута показывать на кнопках
 
-def rebuild_index():
-    global catalog_index
-    cats = [str(p.get("category","")).strip() or "Без категории" for p in catalog]
-    cat_counts = Counter(cats)
-    categories = [c for c,_ in cat_counts.most_common()]
-    brands_by_cat = defaultdict(Counter)
-    for p in catalog:
-        cat = str(p.get("category","")).strip() or "Без категории"
-        brand = (p.get("brand") or "").strip()
-        if brand:
-            brands_by_cat[cat][brand] += 1
-    catalog_index = {"categories": categories, "brands_by_cat": brands_by_cat}
-
-def slugify(s: str) -> str:
-    return re.sub(r"[^a-z0-9\-]+", "_", (s or "").strip().lower())
-
-def unslugify(slug: str, fallback: str = "Без категории") -> str:
-    # подбираем по слагу из catalog_index
-    for c in catalog_index.get("categories", []):
-        if slugify(c) == slug:
-            return c
-    return fallback
-
-# состояние для автообновления/напоминаний
+# автонапоминания
 _catalog_etag = None
 _catalog_last_modified = None
 _catalog_last_items = 0
-_catalog_last_change = None       # datetime UTC когда реально обновили состав
-_last_reminder_at = None          # datetime UTC когда отправляли последнее напоминание
+_catalog_last_change = None
+_last_reminder_at = None
 
-# карточки/кнопки
+# карточка товара
 def product_caption(p):
     price = p.get("price"); stock = p.get("stock")
     return "\n".join([
@@ -158,7 +147,7 @@ def product_keyboard(p):
     pid = p.get("id") or p.get("sku")
     btns = [[InlineKeyboardButton("📝 Забронировать", callback_data=f"reserve:{pid}")]]
     if p.get("category"):
-        btns.append([InlineKeyboardButton(f"📂 Категория: {p['category']}", callback_data=f"cat:{slugify(p['category'])}|p:1")])
+        btns.append([InlineKeyboardButton(f"📂 Категория: {p['category']}", callback_data=f"cats:p:1")])
     btns.append([InlineKeyboardButton("🔎 Искать в чате", switch_inline_query_current_chat=p.get("sku",""))])
     return InlineKeyboardMarkup(btns)
 
@@ -167,7 +156,376 @@ def send_product_message(message, p):
     if img: message.reply_photo(img, caption=caption, reply_markup=kb)
     else:   message.reply_text(caption, reply_markup=kb)
 
-# поиск/намерение
+# ───────────── Парсеры каталогов (YML, CommerceML) ─────────────
+def _normalize_attr_name(n: str) -> str:
+    n = (n or "").strip()
+    # немного нормализации часто встречающихся полей
+    replacements = {
+        "Номинальный ток, А": "Номинальный ток, А",
+        "Номинальный ток": "Номинальный ток, А",
+        "Катушка управления, В": "Катушка управления, В",
+        "Степень защиты, IP": "Степень защиты, IP",
+        "IP": "Степень защиты, IP",
+        "Серия": "Серия",
+        "Вид привода": "Вид привода",
+        "В корпусе": "В корпусе",
+        "С тепловым реле": "С тепловым реле",
+        "Число и исполнение доп. контактов": "Число и исполнение доп. контактов",
+    }
+    return replacements.get(n, n)
+
+def parse_tilda_yml(xml_bytes: bytes) -> list[dict]:
+    root = ET.fromstring(xml_bytes)
+    cat_map = {}
+    for c in root.findall(".//categories/category"):
+        cid = c.get("id") or ""
+        name = (c.text or "").strip()
+        if cid: cat_map[cid] = name
+    items = []
+    for o in root.findall(".//offers/offer"):
+        sku = o.get("id") or (o.findtext("vendorCode") or "")
+        name = o.findtext("name") or ""
+        brand = o.findtext("vendor") or ""
+        price = o.findtext("price")
+        img = o.findtext("picture") or ""
+        cat_id = o.findtext("categoryId") or ""
+        category = cat_map.get(cat_id, "") or "Без категории"
+
+        # собрать параметры
+        attrs = {}
+        for prm in o.findall("param"):
+            an = prm.get("name") or ""
+            av = (prm.text or "").strip()
+            if not an or not av: continue
+            attrs[_normalize_attr_name(an)] = av
+
+        low_blob = " ".join([name] + [f"{k}: {v}" for k,v in attrs.items()]).lower()
+        itype = "кабель" if "кабел" in low_blob else (
+            "автомат" if ("автомат" in low_blob or "выключат" in low_blob) else (
+                "пускатель" if "пускател" in low_blob else ""
+            )
+        )
+        amp = None; sqmm = None
+        m_amp = re.search(r"(\d{2,3})\s*а\b", low_blob)
+        if m_amp: amp = int(m_amp.group(1))
+        m_sq = re.search(r"(\d{1,3})\s*мм[²2]|\b(\d{1,3})\s*sqmm", low_blob)
+        if m_sq: sqmm = int([g for g in m_sq.groups() if g][0])
+
+        items.append({
+            "id": sku or name, "sku": sku or name, "name": name,
+            "type": itype, "brand": brand, "category": category,
+            "amp": amp, "sqmm": sqmm,
+            "price": float(price) if price else None,
+            "stock": None, "image_url": img,
+            "attrs": attrs
+        })
+    return items
+
+def parse_commerceml(xml_bytes: bytes) -> list[dict]:
+    # Попытка распарсить атрибуты из CommerceML (может отличаться у разных конфигураций)
+    def _attrs_from(root, node):
+        attrs = {}
+        # 1С может хранить в: <ЗначенияСвойств/ЗначенияСвойства><Наименование>..<Значение>..
+        for z in node.findall(".//ЗначенияСвойств/ЗначенияСвойства"):
+            an = z.findtext("Наименование") or ""
+            av = z.findtext("Значение") or ""
+            if an and av:
+                attrs[_normalize_attr_name(an)] = av.strip()
+        # Иногда встречается <ХарактеристикиТовара>
+        for z in node.findall(".//ХарактеристикиТовара/ХарактеристикаТовара"):
+            an = z.findtext("Наименование") or ""
+            av = z.findtext("Значение") or ""
+            if an and av:
+                attrs[_normalize_attr_name(an)] = av.strip()
+        return attrs
+
+    def _parse_catalog(root):
+        cat={}
+        for t in root.findall(".//Товары/Товар"):
+            _id=(t.findtext("Ид") or "").strip()
+            name=(t.findtext("Наименование") or "").strip()
+            sku=(t.findtext("Артикул") or "") or _id
+            brand=(t.findtext("Изготовитель/Наименование") or t.findtext("Бренд") or "").strip()
+            image=(t.findtext("Картинка") or "").strip()
+            # категория по Ид группы
+            catref=t.find(".//Группы/Ид"); category=(catref.text or "").strip() if catref is not None else "Без категории"
+            attrs = _attrs_from(root, t)
+
+            low = f"{name} {json.dumps(attrs, ensure_ascii=False)}".lower()
+            itype="кабель" if "кабел" in low else ("автомат" if ("автомат" in low or "выключат" in low) else ("пускатель" if "пускател" in low else ""))
+            amp=sqmm=None
+            m_amp=re.search(r"(\d{2,3})\s*а\b", low); m_sq=re.search(r"(\d{1,3})\s*мм[²2]|\b(\d{1,3})\s*sqmm", low)
+            if m_amp: amp=int(m_amp.group(1))
+            if m_sq:  sqmm=int([g for g in m_sq.groups() if g][0])
+            if _id:
+                cat[_id]={"id":_id,"sku":sku,"name":name or sku,"brand":brand,"category":category,
+                          "image_url":image,"type":itype,"amp":amp,"sqmm":sqmm,"attrs":attrs}
+        # заменим Ид группы на имя
+        for g in root.findall(".//Группы/Группа"):
+            gid=(g.findtext("Ид") or "").strip(); gname=(g.findtext("Наименование") or "").strip()
+            if gid and gname:
+                for v in cat.values():
+                    if v.get("category")==gid: v["category"]=gname or "Без категории"
+        return cat
+
+    def _parse_offers(root):
+        offers={}
+        for o in root.findall(".//Предложения/Предложение"):
+            _id=(o.findtext("Ид") or "").strip()
+            if not _id: continue
+            price=None; qnode=o.find(".//Цены/Цена/ЦенаЗаЕдиницу")
+            if qnode is not None and qnode.text:
+                try: price=float(qnode.text.replace(",", ".").strip())
+                except: price=None
+            stock=None; qty=o.find("Количество")
+            if qty is not None and qty.text:
+                try: stock=int(float(qty.text.replace(",", ".").strip()))
+                except: stock=None
+            offers[_id]={"price":price,"stock":stock}
+        return offers
+
+    def _one(xml_b: bytes):
+        root=ET.fromstring(xml_b); cat_map=_parse_catalog(root); off_map=_parse_offers(root)
+        items=[]; keys=set(cat_map.keys())|set(off_map.keys())
+        for k in keys:
+            base=cat_map.get(k,{}); price=off_map.get(k,{}).get("price"); stock=off_map.get(k,{}).get("stock")
+            items.append({
+                "id":base.get("id",k),"sku":base.get("sku",k),"name":base.get("name",k),
+                "type":base.get("type",""),"brand":base.get("brand",""),"category":base.get("category","Без категории"),
+                "amp":base.get("amp"),"sqmm":base.get("sqmm"),"price":price,"stock":stock,
+                "image_url":base.get("image_url",""),
+                "attrs": base.get("attrs", {})
+            })
+        return items
+
+    if zipfile.is_zipfile(io.BytesIO(xml_bytes)):
+        with zipfile.ZipFile(io.BytesIO(xml_bytes)) as z:
+            cat_map, off_map = {}, {}
+            for name in z.namelist():
+                if not name.lower().endswith(".xml"): continue
+                data=z.read(name); root=ET.fromstring(data)
+                if root.findall(".//Товары/Товар"): cat_map.update({k:v for k,v in _parse_catalog(root).items()})
+                if root.findall(".//Предложения/Предложение"):
+                    for k,v in _parse_offers(root).items(): off_map[k]=v
+            items=[]; keys=set(cat_map.keys())|set(off_map.keys())
+            for k in keys:
+                base=cat_map.get(k,{}); price=off_map.get(k,{}).get("price"); stock=off_map.get(k,{}).get("stock")
+                items.append({
+                    "id":base.get("id",k),"sku":base.get("sku",k),"name":base.get("name",k),
+                    "type":base.get("type",""),"brand":base.get("brand",""),"category":base.get("category","Без категории"),
+                    "amp":base.get("amp"),"sqmm":base.get("sqmm"),"price":price,"stock":stock,
+                    "image_url":base.get("image_url",""),
+                    "attrs": base.get("attrs", {})
+                })
+            return items
+    return _one(xml_bytes)
+
+# ───────────── Индексация каталога ─────────────
+def rebuild_index():
+    global catalog_index
+    cats = [str(p.get("category","")).strip() or "Без категории" for p in catalog]
+    cat_counts = Counter(cats)
+    categories = [c for c,_ in cat_counts.most_common()]
+
+    brands_by_cat = defaultdict(Counter)
+    attrs_by_cat = defaultdict(lambda: defaultdict(Counter))
+
+    for p in catalog:
+        cat = str(p.get("category","")).strip() or "Без категории"
+        brand = (p.get("brand") or "").strip()
+        if brand: brands_by_cat[cat][brand] += 1
+        # включим бренд и некоторые вычисляемые в attrs тоже для единого мастера
+        attrs = dict(p.get("attrs") or {})
+        if brand: attrs.setdefault("Бренд", brand)
+        if isinstance(p.get("stock"), (int,float)):
+            attrs.setdefault("Наличие", "В наличии" if p["stock"] > 0 else "Под заказ")
+        # нормализуем значения
+        for an,av in attrs.items():
+            an_norm = _normalize_attr_name(an)
+            av_norm = str(av).strip()
+            if not an_norm or not av_norm: continue
+            attrs_by_cat[cat][an_norm][av_norm] += 1
+
+    # порядок шагов: сначала «Бренд», затем «Наличие», затем остальные по убыванию охвата
+    steps_by_cat = {}
+    for cat, amap in attrs_by_cat.items():
+        keys = list(amap.keys())
+        # приоритет
+        def _key_rank(k):
+            if k.lower() == "бренд": return (0, -sum(amap[k].values()))
+            if k.lower() == "наличие": return (1, -sum(amap[k].values()))
+            return (2, -sum(amap[k].values()))
+        keys.sort(key=_key_rank)
+        steps_by_cat[cat] = keys
+
+    catalog_index = {
+        "categories": categories,
+        "brands_by_cat": brands_by_cat,
+        "attrs_by_cat": attrs_by_cat,
+        "attr_steps_by_cat": steps_by_cat,
+    }
+
+# ───────────── Загрузка каталога + автонапоминания ─────────────
+def fetch_catalog(force=False):
+    global catalog, catalog_last_fetch, _catalog_etag, _catalog_last_modified
+    global _catalog_last_items, _catalog_last_change
+
+    with catalog_lock:
+        now = datetime.now(timezone.utc)
+        if not force and catalog_last_fetch and now - catalog_last_fetch < timedelta(minutes=CATALOG_REFRESH_MIN):
+            return False
+        if not CATALOG_URL:
+            log.warning("CATALOG_URL не задан — пропускаю загрузку каталога")
+            return False
+
+        headers = {}
+        if _catalog_etag: headers["If-None-Match"] = _catalog_etag
+        if _catalog_last_modified: headers["If-Modified-Since"] = _catalog_last_modified
+        auth = (CATALOG_AUTH_USER, CATALOG_AUTH_PASS) if CATALOG_AUTH_USER else None
+
+        try:
+            try:
+                h = requests.head(CATALOG_URL, auth=auth, timeout=20)
+                if h.status_code in (200, 304):
+                    lm = h.headers.get("Last-Modified"); et = h.headers.get("ETag")
+                    if not force and et and _catalog_etag and et == _catalog_etag:
+                        catalog_last_fetch = now; return False
+                    if not force and lm and _catalog_last_modified and lm == _catalog_last_modified:
+                        catalog_last_fetch = now; return False
+            except Exception:
+                pass
+
+            r = requests.get(CATALOG_URL, auth=auth, timeout=60, headers=headers)
+            if r.status_code == 304:
+                catalog_last_fetch = now; return False
+            r.raise_for_status()
+
+            ct = (r.headers.get("content-type") or "").lower()
+            url_l = CATALOG_URL.lower()
+
+            if "xml" in ct and url_l.endswith(".yml"):
+                items = parse_tilda_yml(r.content)
+            elif "xml" in ct or "zip" in ct or url_l.endswith((".xml", ".zip")):
+                try: items = parse_commerceml(r.content)
+                except Exception: items = parse_tilda_yml(r.content)
+            elif "application/json" in ct or url_l.endswith(".json"):
+                data = r.json()
+                if not isinstance(data, list): log.error("JSON корень не список"); return False
+                items = data
+            elif "text/csv" in ct or url_l.endswith(".csv"):
+                f = io.StringIO(r.text); reader = csv.DictReader(f); items=[]
+                for row in reader:
+                    def _i(v):
+                        try: return int(str(v).strip().replace(" ", "")) if str(v).strip() else None
+                        except: return None
+                    def _f(v):
+                        try: return float(str(v).replace(",", ".").strip()) if str(v).strip() else None
+                        except: return None
+                    items.append({
+                        "id": row.get("id") or row.get("sku") or row.get("ID"),
+                        "sku": row.get("sku") or row.get("SKU"),
+                        "name": row.get("name") or row.get("Name"),
+                        "type": (row.get("type") or "").lower(),
+                        "brand": row.get("brand") or row.get("Brand"),
+                        "category": (row.get("category") or row.get("Category") or "Без категории"),
+                        "amp": _i(row.get("amp")), "sqmm": _i(row.get("sqmm")),
+                        "price": _f(row.get("price")), "stock": _i(row.get("stock")),
+                        "image_url": row.get("image_url") or row.get("image") or row.get("Image"),
+                        "attrs": {}  # CSV атрибуты не парсим
+                    })
+            else:
+                log.error("Неизвестный формат каталога: %s", ct or url_l); return False
+
+            # нормализация
+            norm=[]
+            for p in items:
+                if not p or not p.get("name"): 
+                    continue
+                p.setdefault("id", p.get("sku") or p.get("name"))
+                p.setdefault("sku", p.get("id"))
+                p.setdefault("brand",""); p.setdefault("category","Без категории"); p.setdefault("type","")
+                p.setdefault("attrs", {})
+                norm.append(p)
+            catalog = norm
+            catalog_last_fetch = now
+
+            new_etag = r.headers.get("ETag"); new_lm = r.headers.get("Last-Modified")
+            if new_etag: _catalog_etag = new_etag
+            if new_lm: _catalog_last_modified = new_lm
+
+            changed = (len(catalog) != _catalog_last_items)
+            _catalog_last_items = len(catalog)
+            if changed: _catalog_last_change = now
+
+            rebuild_index()
+
+            log.info("Каталог обновлён: %d позиций (из %s)", len(catalog), CATALOG_URL)
+
+            if AUTOSYNC_NOTIFY and TELEGRAM_ADMIN_ID and changed:
+                try:
+                    app.send_message(TELEGRAM_ADMIN_ID, f"✅ Каталог обновлён: {len(catalog)} позиций\nИсточник: {CATALOG_URL}")
+                except Exception:
+                    traceback.print_exc()
+            return True
+
+        except Exception as e:
+            traceback.print_exc()
+            log.error("Ошибка загрузки каталога: %s", e)
+            return False
+
+def periodic_refresh():
+    global _last_reminder_at
+    try:
+        updated = fetch_catalog(force=False)
+        now = datetime.now(timezone.utc)
+        if TELEGRAM_ADMIN_ID and AUTOSYNC_NOTIFY and AUTOSYNC_REMIND_EVERY_MIN > 0:
+            last_change = _catalog_last_change or catalog_last_fetch
+            if last_change:
+                due_change = now - last_change >= timedelta(minutes=AUTOSYNC_REMIND_EVERY_MIN)
+                due_rem = (not _last_reminder_at) or (now - _last_reminder_at >= timedelta(minutes=AUTOSYNC_REMIND_EVERY_MIN))
+                if not updated and due_change and due_rem:
+                    try:
+                        app.send_message(TELEGRAM_ADMIN_ID,
+                            "ℹ️ Каталог не обновлялся. Если в Tilda есть новые данные из 1С, "
+                            "нажми «Начать экспорт» в Tilda, затем /sync1c (или жми кнопку)."
+                        )
+                        _last_reminder_at = now
+                    except Exception:
+                        traceback.print_exc()
+    finally:
+        threading.Timer(CATALOG_REFRESH_MIN * 60, periodic_refresh).start()
+
+# ───────────── HTTP-хук ─────────────
+class _HookHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            url = urlparse(self.path)
+            if url.path != "/hook/tilda-export":
+                self.send_response(404); self.end_headers(); self.wfile.write(b"Not found"); return
+            qs = parse_qs(url.query or ""); token = (qs.get("token") or [""])[0]
+            if SECRET_EXPORT_TOKEN and token != SECRET_EXPORT_TOKEN:
+                self.send_response(401); self.end_headers(); self.wfile.write(b"Unauthorized"); return
+            ok = fetch_catalog(force=True)
+            try:
+                if TELEGRAM_ADMIN_ID:
+                    app.send_message(TELEGRAM_ADMIN_ID, ("✅ Каталог обновлён немедленно" if ok else "ℹ️ Каталог не изменился (304)") + f"\nИсточник: {CATALOG_URL}")
+            except Exception:
+                traceback.print_exc()
+            self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+        except Exception:
+            traceback.print_exc()
+            try: self.send_response(500); self.end_headers(); self.wfile.write(b"ERROR")
+            except Exception: pass
+
+def _run_http_server():
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), _HookHandler)
+        log.info("HTTP hook server on port %s started", HTTP_PORT)
+        srv.serve_forever()
+    except Exception:
+        traceback.print_exc()
+
+# ───────────── Поиск / намерение (как раньше) ─────────────
 INTENT = re.compile(
     r"(?P<what>кабель|провод|автомат|выключател[ьяь]|пускател[ьяи])?"
     r".*?(?P<num>\d{1,3})\s*(?P<unit>мм2|мм²|мм|sqmm|а|a)?",
@@ -231,329 +589,28 @@ def suggest_alternatives(intent, limit=6):
         if isinstance(val,(int,float)): al.append((abs(val-target), p))
     al.sort(key=lambda x:x[0]); return [p for _,p in al[:limit]]
 
-# ───────────── Парсеры каталогов ─────────────
-def parse_tilda_yml(xml_bytes: bytes) -> list[dict]:
-    root = ET.fromstring(xml_bytes)
-    cat_map = {}
-    for c in root.findall(".//categories/category"):
-        cid = c.get("id") or ""
-        name = (c.text or "").strip()
-        if cid: cat_map[cid] = name
-    items = []
-    for o in root.findall(".//offers/offer"):
-        sku = o.get("id") or (o.findtext("vendorCode") or "")
-        name = o.findtext("name") or ""
-        brand = o.findtext("vendor") or ""
-        price = o.findtext("price")
-        img = o.findtext("picture") or ""
-        cat_id = o.findtext("categoryId") or ""
-        category = cat_map.get(cat_id, "") or "Без категории"
-        text_for_parse = " ".join([
-            name,
-            " ".join([(p.text or "") for p in o.findall("param") if p is not None]),
-        ]).lower()
-        itype = "кабель" if "кабел" in text_for_parse else (
-            "автомат" if ("автомат" in text_for_parse or "выключат" in text_for_parse) else (
-                "пускатель" if "пускател" in text_for_parse else ""
-            )
-        )
-        amp = None; sqmm = None
-        m_amp = re.search(r"(\d{2,3})\s*а\b", text_for_parse)
-        if m_amp: amp = int(m_amp.group(1))
-        m_sq = re.search(r"(\d{1,3})\s*мм[²2]|\b(\d{1,3})\s*sqmm", text_for_parse)
-        if m_sq: sqmm = int([g for g in m_sq.groups() if g][0])
-        items.append({
-            "id": sku or name, "sku": sku or name, "name": name,
-            "type": itype, "brand": brand, "category": category,
-            "amp": amp, "sqmm": sqmm,
-            "price": float(price) if price else None,
-            "stock": None, "image_url": img
-        })
-    return items
-
-def parse_commerceml(xml_bytes: bytes) -> list[dict]:
-    def _parse_catalog(root):
-        cat={}
-        for t in root.findall(".//Товары/Товар"):
-            _id=(t.findtext("Ид") or "").strip()
-            name=(t.findtext("Наименование") or "").strip()
-            sku=(t.findtext("Артикул") or "") or _id
-            brand=(t.findtext("Изготовитель/Наименование") or t.findtext("Бренд") or "").strip()
-            image=(t.findtext("Картинка") or "").strip()
-            catref=t.find(".//Группы/Ид"); category=(catref.text or "").strip() if catref is not None else "Без категории"
-            low=f"{name} {(t.findtext('Описание') or '')}".lower()
-            itype="кабель" if "кабел" in low else ("автомат" if ("автомат" in low or "выключат" in low) else ("пускатель" if "пускател" in low else ""))
-            amp=sqmm=None
-            m_amp=re.search(r"(\d{2,3})\s*а\b", low); m_sq=re.search(r"(\d{1,3})\s*мм[²2]|\b(\d{1,3})\s*sqmm", low)
-            if m_amp: amp=int(m_amp.group(1))
-            if m_sq:  sqmm=int([g for g in m_sq.groups() if g][0])
-            if _id:
-                cat[_id]={"id":_id,"sku":sku,"name":name or sku,"brand":brand,"category":category,
-                          "image_url":image,"type":itype,"amp":amp,"sqmm":sqmm}
-        for g in root.findall(".//Группы/Группа"):
-            gid=(g.findtext("Ид") or "").strip(); gname=(g.findtext("Наименование") or "").strip()
-            if gid and gname:
-                for v in cat.values():
-                    if v.get("category")==gid: v["category"]=gname or "Без категории"
-        return cat
-    def _parse_offers(root):
-        offers={}
-        for o in root.findall(".//Предложения/Предложение"):
-            _id=(o.findtext("Ид") or "").strip()
-            if not _id: continue
-            price=None; qnode=o.find(".//Цены/Цена/ЦенаЗаЕдиницу")
-            if qnode is not None and qnode.text:
-                try: price=float(qnode.text.replace(",", ".").strip())
-                except: price=None
-            stock=None; qty=o.find("Количество")
-            if qty is not None and qty.text:
-                try: stock=int(float(qty.text.replace(",", ".").strip()))
-                except: stock=None
-            offers[_id]={"price":price,"stock":stock}
-        return offers
-    def _one(xml_b: bytes):
-        root=ET.fromstring(xml_b); cat_map=_parse_catalog(root); off_map=_parse_offers(root)
-        items=[]; keys=set(cat_map.keys())|set(off_map.keys())
-        for k in keys:
-            base=cat_map.get(k,{}); price=off_map.get(k,{}).get("price"); stock=off_map.get(k,{}).get("stock")
-            items.append({
-                "id":base.get("id",k),"sku":base.get("sku",k),"name":base.get("name",k),
-                "type":base.get("type",""),"brand":base.get("brand",""),"category":base.get("category","Без категории"),
-                "amp":base.get("amp"),"sqmm":base.get("sqmm"),"price":price,"stock":stock,
-                "image_url":base.get("image_url","")
-            })
-        return items
-    if zipfile.is_zipfile(io.BytesIO(xml_bytes)):
-        with zipfile.ZipFile(io.BytesIO(xml_bytes)) as z:
-            cat_map, off_map = {}, {}
-            for name in z.namelist():
-                if not name.lower().endswith(".xml"): continue
-                data=z.read(name); root=ET.fromstring(data)
-                if root.findall(".//Товары/Товар"): cat_map.update(_parse_catalog(root))
-                if root.findall(".//Предложения/Предложение"):
-                    for k,v in _parse_offers(root).items(): off_map[k]=v
-            items=[]; keys=set(cat_map.keys())|set(off_map.keys())
-            for k in keys:
-                base=cat_map.get(k,{}); price=off_map.get(k,{}).get("price"); stock=off_map.get(k,{}).get("stock")
-                items.append({
-                    "id":base.get("id",k),"sku":base.get("sku",k),"name":base.get("name",k),
-                    "type":base.get("type",""),"brand":base.get("brand",""),"category":base.get("category","Без категории"),
-                    "amp":base.get("amp"),"sqmm":base.get("sqmm"),"price":price,"stock":stock,
-                    "image_url":base.get("image_url","")
-                })
-            return items
-    return _one(xml_bytes)
-
-# ───────────── Загрузка каталога + автонапоминания ─────────────
-def fetch_catalog(force=False):
-    """
-    Загружает каталог из CATALOG_URL: YML (Tilda/ЯМ), CommerceML (XML/ZIP), JSON, CSV.
-    Делает условные запросы (ETag/Last-Modified). При изменении — обновляет и уведомляет админа.
-    """
-    global catalog, catalog_last_fetch, _catalog_etag, _catalog_last_modified
-    global _catalog_last_items, _catalog_last_change
-
-    with catalog_lock:
-        now = datetime.now(timezone.utc)
-        if not force and catalog_last_fetch and now - catalog_last_fetch < timedelta(minutes=CATALOG_REFRESH_MIN):
-            return False
-        if not CATALOG_URL:
-            log.warning("CATALOG_URL не задан — пропускаю загрузку каталога")
-            return False
-
-        headers = {}
-        if _catalog_etag:
-            headers["If-None-Match"] = _catalog_etag
-        if _catalog_last_modified:
-            headers["If-Modified-Since"] = _catalog_last_modified
-
-        auth = (CATALOG_AUTH_USER, CATALOG_AUTH_PASS) if CATALOG_AUTH_USER else None
-
-        try:
-            # HEAD для быстрой проверки
-            try:
-                h = requests.head(CATALOG_URL, auth=auth, timeout=20)
-                if h.status_code in (200, 304):
-                    lm = h.headers.get("Last-Modified")
-                    et = h.headers.get("ETag")
-                    if not force and et and _catalog_etag and et == _catalog_etag:
-                        catalog_last_fetch = now; return False
-                    if not force and lm and _catalog_last_modified and lm == _catalog_last_modified:
-                        catalog_last_fetch = now; return False
-            except Exception:
-                pass
-
-            r = requests.get(CATALOG_URL, auth=auth, timeout=60, headers=headers)
-            if r.status_code == 304:
-                catalog_last_fetch = now
-                return False
-            r.raise_for_status()
-
-            ct = (r.headers.get("content-type") or "").lower()
-            url_l = CATALOG_URL.lower()
-
-            items = []
-            if "xml" in ct and url_l.endswith(".yml"):
-                items = parse_tilda_yml(r.content)
-            elif "xml" in ct or "zip" in ct or url_l.endswith((".xml", ".zip")):
-                try:
-                    items = parse_commerceml(r.content)
-                except Exception:
-                    items = parse_tilda_yml(r.content)
-            elif "application/json" in ct or url_l.endswith(".json"):
-                data = r.json()
-                if not isinstance(data, list):
-                    log.error("JSON корень не список"); return False
-                items = data
-            elif "text/csv" in ct or url_l.endswith(".csv"):
-                f = io.StringIO(r.text); reader = csv.DictReader(f)
-                for row in reader:
-                    def _i(v):
-                        try: return int(str(v).strip().replace(" ", "")) if str(v).strip() else None
-                        except: return None
-                    def _f(v):
-                        try: return float(str(v).replace(",", ".").strip()) if str(v).strip() else None
-                        except: return None
-                    items.append({
-                        "id": row.get("id") or row.get("sku") or row.get("ID"),
-                        "sku": row.get("sku") or row.get("SKU"),
-                        "name": row.get("name") or row.get("Name"),
-                        "type": (row.get("type") or "").lower(),
-                        "brand": row.get("brand") or row.get("Brand"),
-                        "category": (row.get("category") or row.get("Category") or "Без категории"),
-                        "amp": _i(row.get("amp")), "sqmm": _i(row.get("sqmm")),
-                        "price": _f(row.get("price")), "stock": _i(row.get("stock")),
-                        "image_url": row.get("image_url") or row.get("image") or row.get("Image"),
-                    })
-            else:
-                log.error("Неизвестный формат каталога: %s", ct or url_l); return False
-
-            # нормализация
-            norm = []
-            for p in items:
-                if not p or not p.get("name"): 
-                    continue
-                p.setdefault("id", p.get("sku") or p.get("name"))
-                p.setdefault("sku", p.get("id"))
-                p.setdefault("brand",""); p.setdefault("category","Без категории"); p.setdefault("type","")
-                norm.append(p)
-
-            catalog = norm
-            catalog_last_fetch = now
-
-            # заголовки / состояние
-            new_etag = r.headers.get("ETag")
-            new_lm = r.headers.get("Last-Modified")
-            if new_etag: _catalog_etag = new_etag
-            if new_lm: _catalog_last_modified = new_lm
-
-            changed = (len(catalog) != _catalog_last_items)
-            _catalog_last_items = len(catalog)
-            if changed:
-                _catalog_last_change = now
-
-            # перестроим индекс
-            rebuild_index()
-
-            log.info("Каталог обновлён: %d позиций (из %s)", len(catalog), CATALOG_URL)
-
-            if AUTOSYNC_NOTIFY and TELEGRAM_ADMIN_ID and changed:
-                try:
-                    app.send_message(
-                        TELEGRAM_ADMIN_ID,
-                        f"✅ Каталог обновлён: {len(catalog)} позиций\nИсточник: {CATALOG_URL}"
-                    )
-                except Exception:
-                    traceback.print_exc()
-
-            return True
-
-        except Exception as e:
-            traceback.print_exc()
-            log.error("Ошибка загрузки каталога: %s", e)
-            return False
-
-def periodic_refresh():
-    global _last_reminder_at
-    try:
-        updated = fetch_catalog(force=False)
-        now = datetime.now(timezone.utc)
-        if TELEGRAM_ADMIN_ID and AUTOSYNC_NOTIFY and AUTOSYNC_REMIND_EVERY_MIN > 0:
-            last_change = _catalog_last_change or catalog_last_fetch
-            if last_change:
-                due_since_change = now - last_change >= timedelta(minutes=AUTOSYNC_REMIND_EVERY_MIN)
-                due_since_reminder = (not _last_reminder_at) or (now - _last_reminder_at >= timedelta(minutes=AUTOSYNC_REMIND_EVERY_MIN))
-                if not updated and due_since_change and due_since_reminder:
-                    try:
-                        app.send_message(
-                            TELEGRAM_ADMIN_ID,
-                            "ℹ️ Каталог не обновлялся. Если в Tilda есть новые данные из 1С, "
-                            "нажми «Начать экспорт» в Tilda, затем /sync1c (или жми кнопку)."
-                        )
-                        _last_reminder_at = now
-                    except Exception:
-                        traceback.print_exc()
-    finally:
-        threading.Timer(CATALOG_REFRESH_MIN * 60, periodic_refresh).start()
-
-# ───────────── HTTP-хук для мгновенного обновления ─────────────
-class _HookHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        try:
-            url = urlparse(self.path)
-            if url.path != "/hook/tilda-export":
-                self.send_response(404); self.end_headers(); self.wfile.write(b"Not found"); return
-            qs = parse_qs(url.query or "")
-            token = (qs.get("token") or [""])[0]
-            if SECRET_EXPORT_TOKEN and token != SECRET_EXPORT_TOKEN:
-                self.send_response(401); self.end_headers(); self.wfile.write(b"Unauthorized"); return
-
-            ok = fetch_catalog(force=True)
-            try:
-                if TELEGRAM_ADMIN_ID:
-                    app.send_message(
-                        TELEGRAM_ADMIN_ID,
-                        ("✅ Каталог обновлён немедленно" if ok else "ℹ️ Каталог не изменился (304)")
-                        + f"\nИсточник: {CATALOG_URL}"
-                    )
-            except Exception:
-                traceback.print_exc()
-
-            self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
-        except Exception:
-            traceback.print_exc()
-            try:
-                self.send_response(500); self.end_headers(); self.wfile.write(b"ERROR")
-            except Exception:
-                pass
-
-def _run_http_server():
-    try:
-        srv = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), _HookHandler)
-        log.info("HTTP hook server on port %s started", HTTP_PORT)
-        srv.serve_forever()
-    except Exception:
-        traceback.print_exc()
-
-# ───────────── Pyrogram (личные чаты, сессия в памяти) ─────────────
-app = Client(
-    "my_bot",
-    bot_token=BOT_TOKEN,
-    api_id=API_ID,
-    api_hash=API_HASH,
-    in_memory=True
-)
-
-# ───────────── ВСПОМОГАТЕЛЬНЫЕ ДЛЯ КАТЕГОРИЙ/ФИЛЬТРОВ ─────────────
-def filter_items_by(cat_name: str, brand: str = "", in_stock: int = 0):
+# ───────────── Помощники фильтрации ─────────────
+def filter_items_by_advanced(cat_name: str, selections: dict) -> list:
+    """selections: {attr_name: value} — совпадение по attrs, а также "Бренд"/"Наличие" если есть."""
     cat = cat_name or "Без категории"
     items = [p for p in catalog if (str(p.get("category","")) or "Без категории") == cat]
-    if brand:
-        items = [p for p in items if (p.get("brand") or "").strip().lower() == brand.strip().lower()]
-    if in_stock == 1:
-        items = [p for p in items if isinstance(p.get("stock"), (int,float)) and p.get("stock", 0) > 0]
+    for an, val in selections.items():
+        if not val or val == "-": 
+            continue
+        if an == "Наличие":
+            if val == "В наличии":
+                items = [p for p in items if isinstance(p.get("stock"), (int,float)) and p.get("stock", 0) > 0]
+            elif val == "Под заказ":
+                items = [p for p in items if not (isinstance(p.get("stock"), (int,float)) and p.get("stock", 0) > 0)]
+            continue
+        if an == "Бренд":
+            items = [p for p in items if (p.get("brand") or "").strip().lower() == val.strip().lower()]
+            continue
+        # обычный атрибут
+        items = [p for p in items if val == (p.get("attrs") or {}).get(an)]
     return items
 
+# ───────────── Визуал «Категории» ─────────────
 def build_cat_list_kb(page: int = 1):
     cats = catalog_index.get("categories", [])
     total = len(cats)
@@ -565,71 +622,120 @@ def build_cat_list_kb(page: int = 1):
     chunk = cats[start:start+CAT_PAGE]
     rows = []
     for c in chunk:
-        rows.append([InlineKeyboardButton(f"{c}", callback_data=f"cat:{slugify(c)}|p:1")])
+        rows.append([InlineKeyboardButton(f"{c}", callback_data=f"fw2:cat:{slugify(c)}|i:0|sel:")])  # старт мастера v2
     nav = []
     if page > 1: nav.append(InlineKeyboardButton("« Назад", callback_data=f"cats:p:{page-1}"))
     if page < pages: nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"cats:p:{page+1}"))
     if nav: rows.append(nav)
     return InlineKeyboardMarkup(rows)
 
-def build_items_kb(cat_slug: str, page: int, brand: str = "", in_stock: int = 0):
+# ───────────── Мастер динамических атрибутов (fw2) ─────────────
+def _cat_steps(cat):
+    return catalog_index.get("attr_steps_by_cat", {}).get(cat, [])
+
+def _cat_attr_values(cat, attr):
+    return [v for v,_ in catalog_index.get("attrs_by_cat", {}).get(cat, {}).get(attr, Counter()).most_common()]
+
+def _decode_sel(sel_str: str) -> OrderedDict:
+    """sel_str = urlencoded JSON {"Атрибут": "Значение", ...}"""
+    if not sel_str:
+        return OrderedDict()
+    try:
+        data = json.loads(unquote(sel_str))
+        if isinstance(data, dict):
+            return OrderedDict(data)
+    except Exception:
+        pass
+    return OrderedDict()
+
+def _encode_sel(selections: OrderedDict) -> str:
+    return quote(json.dumps(selections, ensure_ascii=False))
+
+def wizard2_text(cat_slug: str, i: int, selections: OrderedDict):
     cat = unslugify(cat_slug)
-    # верхняя строка: фильтры
-    filt_label = f"Фильтры ⋅ Бренд: {brand or 'любой'} ⋅ В наличии: {'да' if in_stock==1 else 'все'}"
-    rows = [[InlineKeyboardButton(filt_label, callback_data=f"f:{cat_slug}|b:{brand or '-'}|s:{in_stock}")]]
-    # навигация по страницам
-    items = filter_items_by(cat, brand, in_stock)
-    total = len(items)
-    pages = max(1, (total + ITEMS_PAGE - 1) // ITEMS_PAGE)
-    page = max(1, min(page, pages))
-    nav = []
-    if page > 1: nav.append(InlineKeyboardButton("« Назад", callback_data=f"cat:{cat_slug}|p:{page-1}|b:{brand or '-'}|s:{in_stock}"))
-    nav.append(InlineKeyboardButton(f"{page}/{pages}", callback_data="noop"))
-    if page < pages: nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"cat:{cat_slug}|p:{page+1}|b:{brand or '-'}|s:{in_stock}"))
-    rows.append(nav)
-    # кнопка «к списку категорий»
+    steps = _cat_steps(cat)
+    lines = [f"📂 Категория: *{cat}*",
+             "Выбирай параметры. Можно пропустить любой шаг или показать товары в любой момент."]
+    if steps:
+        for idx, an in enumerate(steps):
+            mark = "✅" if an in selections else "—"
+            val = selections.get(an, "не выбрано")
+            pointer = " ← сейчас" if idx == i else ""
+            lines.append(f"{idx+1}) {an}: *{val}* {mark}{pointer}")
+    else:
+        lines.append("_Для этой категории нет атрибутов._")
+    return "\n".join(lines)
+
+def kb_wizard2(cat_slug: str, i: int, selections: OrderedDict):
+    cat = unslugify(cat_slug)
+    steps = _cat_steps(cat)
+    rows = []
+
+    if steps and 0 <= i < len(steps):
+        an = steps[i]
+        values = _cat_attr_values(cat, an)[:VALUES_PER_STEP]
+        if values:
+            for v in values:
+                sel2 = OrderedDict(selections)
+                sel2[an] = v
+                rows.append([InlineKeyboardButton(v, callback_data=f"fw2:cat:{cat_slug}|i:{i+1}|sel:{_encode_sel(sel2)}")])
+        else:
+            rows.append([InlineKeyboardButton("Нет значений", callback_data="noop")])
+
+        # спец-выборы
+        rows.append([
+            InlineKeyboardButton("Пропустить", callback_data=f"fw2:cat:{cat_slug}|i:{i+1}|sel:{_encode_sel(selections)}"),
+            InlineKeyboardButton("Показать сейчас ✅", callback_data=f"fw2show:cat:{cat_slug}|sel:{_encode_sel(selections)}")
+        ])
+
+        # навигация
+        nav = []
+        if i > 0:
+            # Назад откатывает последний выбор, если текущий атрибут уже выбран — снимаем его
+            sel_back = OrderedDict(selections)
+            if an in sel_back:
+                sel_back.pop(an, None)
+            nav.append(InlineKeyboardButton("← Назад", callback_data=f"fw2:cat:{cat_slug}|i:{i-1}|sel:{_encode_sel(sel_back)}"))
+        nav.append(InlineKeyboardButton("Сбросить", callback_data=f"fw2:cat:{cat_slug}|i:0|sel:"))
+        rows.append(nav)
+
+    else:
+        # шаги закончились — финальные варианты
+        rows.append([InlineKeyboardButton("✅ Показать товары", callback_data=f"fw2show:cat:{cat_slug}|sel:{_encode_sel(selections)}")])
+        rows.append([InlineKeyboardButton("← К категориям", callback_data="cats:p:1")])
+
+    # в любой момент можно вернуться к категориям
     rows.append([InlineKeyboardButton("← Категории", callback_data="cats:p:1")])
     return InlineKeyboardMarkup(rows)
 
-def show_category_page(message, cat_slug: str, page: int = 1, brand: str = "", in_stock: int = 0):
-    cat = unslugify(cat_slug)
-    items = filter_items_by(cat, brand, in_stock)
-    total = len(items)
-    if total == 0:
-        message.reply_text(f"Категория «{cat}»: ничего не найдено по текущим фильтрам.")
-        return
-    # контент (self) — выводим текущую страницу товаров
-    start = (page - 1) * ITEMS_PAGE
-    for p in items[start:start+ITEMS_PAGE]:
-        try: send_product_message(message, p)
-        except Exception: traceback.print_exc()
-    # внизу — навигация и фильтры
-    kb = build_items_kb(cat_slug, page, brand, in_stock)
-    summary = f"📂 Категория: {cat}\nНайдено: {total} шт."
-    if brand or in_stock:
-        summary += f"\nФильтры: бренд={brand or 'любой'}, наличие={'да' if in_stock==1 else 'все'}"
-    message.reply_text(summary, reply_markup=kb)
+def wizard2_edit(cq, cat_slug: str, i: int, selections: OrderedDict):
+    txt = wizard2_text(cat_slug, i, selections)
+    kb  = kb_wizard2(cat_slug, i, selections)
+    try:
+        cq.message.edit_text(txt, reply_markup=kb, parse_mode="Markdown")
+    except Exception:
+        cq.message.reply_text(txt, reply_markup=kb, parse_mode="Markdown")
 
-def build_filters_kb(cat_slug: str, brand: str = "", in_stock: int = 0):
+def wizard2_show_results(cq, cat_slug: str, selections: OrderedDict):
     cat = unslugify(cat_slug)
-    top_brands = [b for b,_ in catalog_index.get("brands_by_cat", {}).get(cat, Counter()).most_common(8)]
-    rows = []
-    # переключатель наличия
-    rows.append([InlineKeyboardButton(f"Только в наличии: {'✅' if in_stock==1 else '❌'}", callback_data=f"ft:{cat_slug}|b:{brand or '-'}|s:{0 if in_stock==1 else 1}")])
-    # бренды
-    if not top_brands:
-        rows.append([InlineKeyboardButton("Бренды недоступны", callback_data="noop")])
-    else:
-        for b in top_brands:
-            mark = "• " if (brand and b.lower()==brand.lower()) else ""
-            rows.append([InlineKeyboardButton(f"{mark}{b}", callback_data=f"fb:{cat_slug}|b:{b}|s:{in_stock}")])
-        # сброс бренда
-        if brand:
-            rows.append([InlineKeyboardButton("Сбросить бренд", callback_data=f"fb:{cat_slug}|b:-|s:{in_stock}")])
-    # готово / назад
-    rows.append([InlineKeyboardButton("Показать товары", callback_data=f"cat:{cat_slug}|p:1|b:{brand or '-'}|s:{in_stock}")])
-    rows.append([InlineKeyboardButton("← Назад к товарам", callback_data=f"cat:{cat_slug}|p:1|b:{brand or '-'}|s:{in_stock}")])
-    return InlineKeyboardMarkup(rows)
+    items = filter_items_by_advanced(cat, selections)
+    header = f"📦 Результаты для «{cat}»"
+    if selections:
+        pretty = ", ".join([f"{k}: {v}" for k,v in selections.items()])
+        header += f"\nФильтры: {pretty}"
+    header += f"\nНайдено: {len(items)} шт."
+    try:
+        cq.message.edit_text(header)
+    except Exception:
+        cq.message.reply_text(header)
+    for p in items[:20]:
+        try: send_product_message(cq.message, p)
+        except Exception: traceback.print_exc()
+    if len(items) > 20:
+        cq.message.reply_text(f"Показаны первые 20 из {len(items)}. Уточни фильтры или используй поиск.")
+
+# ───────────── Pyrogram ─────────────
+app = Client("my_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, in_memory=True)
 
 # ───────────── Команды / UI ─────────────
 @app.on_message(filters.private & filters.command("start"))
@@ -644,23 +750,19 @@ def start_handler(_, message):
 
     kb_main = ReplyKeyboardMarkup(base_rows, resize_keyboard=True)
     message.reply_text(
-        "Привет! Я бот магазина ⚡ Пиши: «кабель 35мм», «автомат 400А ABB», или пользуйся кнопками ниже.",
+        "Привет! Я бот магазина ⚡ Выбирай «📂 Категории» → фильтры по шагам (в одном сообщении), "
+        "или пиши: «контактор 25А катушка 220В IP20».",
         reply_markup=kb_main
     )
 
     kb_inline = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📂 Открыть категории", callback_data="cats:p:1")],
-        [InlineKeyboardButton("📦 Топ-10 товаров", callback_data="cat:all|p:1")]
+        [InlineKeyboardButton("📂 Открыть категории", callback_data="cats:p:1")]
     ])
     message.reply_text("Быстрое меню:", reply_markup=kb_inline)
 
 @app.on_message(filters.private & filters.command("help"))
 def help_handler(_, message):
-    message.reply_text("Категории → выбери категорию → листай и фильтруй по бренду/наличию. Или пиши запрос свободным текстом.")
-
-@app.on_message(filters.private & filters.command("catalog"))
-def catalog_cmd(_, message):
-    show_catalog(_, message)
+    message.reply_text("Категории → мастер фильтров (динамические атрибуты по шагам). В любой момент: «Показать сейчас».")
 
 def show_catalog(_, message):
     if not catalog: message.reply_text("Каталог пока пуст, попробуйте позже."); return
@@ -668,12 +770,15 @@ def show_catalog(_, message):
         try: send_product_message(message, p)
         except Exception: traceback.print_exc()
 
+@app.on_message(filters.private & filters.command("catalog"))
+def catalog_cmd(_, message): show_catalog(_, message)
+
 @app.on_message(filters.private & filters.command("find"))
 def find_cmd(_, message):
     query=" ".join(message.command[1:]).strip(); handle_search_text(_, message, query)
 
 def handle_search_text(_, message, text):
-    if not text: message.reply_text("Что ищем? Например: кабель 35мм, автомат 400А ABB."); return
+    if not text: message.reply_text("Что ищем? Например: контактор 25А катушка 220В IP20."); return
     if not catalog: message.reply_text("Каталог пока не загружен."); return
     results=search_products_smart(text, limit=10)
     if results:
@@ -688,65 +793,52 @@ def handle_search_text(_, message, text):
             try: send_product_message(message, p)
             except Exception: traceback.print_exc()
         return
-    message.reply_text("Ничего не нашлось 😕 Уточни запрос: бренд/ток/сечение.")
+    message.reply_text("Ничего не нашлось 😕 Уточни запрос или открой «📂 Категории».")
 
-# Inline callbacks: категории / фильтры / навигация
+# ───────────── Callback’и ─────────────
 @app.on_callback_query()
 def callbacks_handler(client, cq):
     try:
         data=cq.data or ""
-        # список категорий
+
+        # категории (пагинация)
         if data.startswith("cats:"):
-            # cats:p:<n> или cats:refresh
             if data == "cats:refresh":
                 ok = fetch_catalog(force=True)
-                cq.message.reply_text("✅ Каталог обновлён" if ok else "❌ Не удалось обновить каталог")
-            else:
-                m = re.search(r"cats:p:(\d+)", data)
-                page = int(m.group(1)) if m else 1
-                cq.message.reply_text("Категории:", reply_markup=build_cat_list_kb(page))
+                try: cq.message.edit_text("✅ Каталог обновлён" if ok else "❌ Не удалось обновить каталог")
+                except Exception: cq.message.reply_text("✅ Каталог обновлён" if ok else "❌ Не удалось обновить каталог")
+                return cq.answer()
+            m = re.search(r"cats:p:(\d+)", data)
+            page = int(m.group(1)) if m else 1
+            txt = "Категории:"
+            kb = build_cat_list_kb(page)
+            try: cq.message.edit_text(txt, reply_markup=kb)
+            except Exception: cq.message.reply_text(txt, reply_markup=kb)
             return cq.answer()
 
-        # список товаров категории + фильтры в URL
-        if data.startswith("cat:"):
-            # формат: cat:<slug>|p:<n>|b:<brand_or_->|s:<0|1>
-            cat_slug = re.search(r"cat:([^|]+)", data).group(1)
-            page_m = re.search(r"\|p:(\d+)", data); page = int(page_m.group(1)) if page_m else 1
-            brand_m = re.search(r"\|b:([^|]+)", data); brand = brand_m.group(1) if brand_m else "-"
-            in_stock_m = re.search(r"\|s:(\d+)", data); in_stock = int(in_stock_m.group(1)) if in_stock_m else 0
-            brand = "" if brand == "-" else brand
-            show_category_page(cq.message, cat_slug, page, brand, in_stock)
+        # мастер v2: шаг
+        if data.startswith("fw2:cat:"):
+            # fw2:cat:<slug>|i:<index>|sel:<encoded>
+            cat_slug = re.search(r"fw2:cat:([^|]+)", data).group(1)
+            i = int(re.search(r"\|i:(-?\d+)", data).group(1))
+            sel_str_m = re.search(r"\|sel:(.*)$", data)
+            sel = _decode_sel(sel_str_m.group(1) if sel_str_m else "")
+            cat = unslugify(cat_slug)
+            steps = _cat_steps(cat)
+            # ограничим индекс
+            if i < 0: i = 0
+            if steps and i > len(steps): i = len(steps)
+            wizard2_edit(cq, cat_slug, i, sel)
             return cq.answer()
 
-        # открыть меню фильтров
-        if data.startswith("f:"):
-            # f:<cat_slug>|b:<brand_or_->|s:<0|1>
-            cat_slug = re.search(r"f:([^|]+)", data).group(1)
-            brand_m = re.search(r"\|b:([^|]+)", data); brand = brand_m.group(1) if brand_m else "-"
-            in_stock_m = re.search(r"\|s:(\d+)", data); in_stock = int(in_stock_m.group(1)) if in_stock_m else 0
-            brand = "" if brand == "-" else brand
-            cq.message.reply_text(f"Фильтры для «{unslugify(cat_slug)}»:", reply_markup=build_filters_kb(cat_slug, brand, in_stock))
+        # мастер v2: показать сейчас
+        if data.startswith("fw2show:cat:"):
+            cat_slug = re.search(r"fw2show:cat:([^|]+)", data).group(1)
+            sel_str_m = re.search(r"\|sel:(.*)$", data)
+            sel = _decode_sel(sel_str_m.group(1) if sel_str_m else "")
+            wizard2_show_results(cq, cat_slug, sel)
             return cq.answer()
 
-        # выбрать/сбросить бренд
-        if data.startswith("fb:"):
-            cat_slug = re.search(r"fb:([^|]+)", data).group(1)
-            brand = re.search(r"\|b:([^|]+)", data).group(1)
-            brand = "" if brand == "-" else brand
-            in_stock = int(re.search(r"\|s:(\d+)", data).group(1))
-            cq.message.reply_text(f"Фильтры для «{unslugify(cat_slug)}»:", reply_markup=build_filters_kb(cat_slug, brand, in_stock))
-            return cq.answer()
-
-        # переключатель наличия
-        if data.startswith("ft:"):
-            cat_slug = re.search(r"ft:([^|]+)", data).group(1)
-            in_stock = int(re.search(r"\|s:(\d+)", data).group(1))
-            brand_m = re.search(r"\|b:([^|]+)", data); brand = brand_m.group(1) if brand_m else "-"
-            brand = "" if brand == "-" else brand
-            cq.message.reply_text(f"Фильтры для «{unslugify(cat_slug)}»:", reply_markup=build_filters_kb(cat_slug, brand, in_stock))
-            return cq.answer()
-
-        # заглушка
         if data == "noop":
             return cq.answer()
 
@@ -754,7 +846,7 @@ def callbacks_handler(client, cq):
         traceback.print_exc()
         cq.answer("Ошибка обработчика", show_alert=False)
 
-# Команда и админская Reply-кнопка — через regex
+# /sync1c — только админ
 @app.on_message(filters.private & (filters.command("sync1c") | filters.regex("^Обновить каталог$")))
 def sync1c_handler(_, message):
     if TELEGRAM_ADMIN_ID and message.from_user.id != TELEGRAM_ADMIN_ID:
@@ -815,11 +907,15 @@ def image_handler(_, message):
 def text_handler(_, message):
     uid=message.from_user.id; user_text=(message.text or "").strip(); low=user_text.lower()
     if low in ("📦 каталог","каталог"): return show_catalog(_, message)
-    if low in ("📂 категории","категории"): 
-        message.reply_text("Категории:", reply_markup=build_cat_list_kb(page=1)); 
+    if low in ("📂 категории","категории"):
+        try: message.reply_text("Категории:", reply_markup=build_cat_list_kb(page=1))
+        except Exception: message.reply_text("Категории недоступны сейчас.")
         return
-    if low in ("🔎 поиск","поиск"): message.reply_text("Что ищем? Пиши свободно: «кабель 35мм», «автомат 400А ABB»."); return
-    if low in ("🧹 сброс","сброс"): return reset_handler(_, message)
+    if low in ("🔎 поиск","поиск"): message.reply_text("Что ищем? Пиши свободно: «контактор 25А катушка 220В IP20»."); return
+    if low in ("🧹 сброс","сброс"): 
+        chat_history[uid]=[]
+        message.reply_text("🧹 Память очищена!")
+        return
 
     if catalog:
         results=search_products_smart(user_text, limit=8)
@@ -837,7 +933,7 @@ def text_handler(_, message):
             return
 
     if re.search(r"\b(привет|здравствуй|здравствуйте|добрый день|hi|hello)\b", low):
-        message.reply_text("Привет! Напиши, что нужно: «кабель 35мм», «автомат 400А ABB», или открой «📂 Категории»."); return
+        message.reply_text("Привет! Открой «📂 Категории» и собери фильтры по шагам, или напиши, что нужно (пример: «контактор 25А катушка 220В»)."); return
 
     chat_history[uid].append({"role":"user","content":user_text}); chat_history[uid]=clamp_history(chat_history[uid])
     try:
@@ -847,17 +943,12 @@ def text_handler(_, message):
         ]}
         resp=requests.post("https://openrouter.ai/api/v1/chat/completions", headers=or_headers("TelegramBotNLSearch"),
                            json=payload, timeout=60, allow_redirects=False)
-        if resp.status_code!=200: message.reply_text("Не понял запрос. Примеры: «кабель 35мм», «автомат 400А ABB»."); return
+        if resp.status_code!=200: message.reply_text("Не понял запрос. Пример: «контактор 25А катушка 220В» или открой «📂 Категории»."); return
         bot_reply=resp.json()["choices"][0]["message"]["content"].strip() or "🤖 (пустой ответ)"
         chat_history[uid].append({"role":"assistant","content":bot_reply}); chat_history[uid]=clamp_history(chat_history[uid])
         message.reply_text(bot_reply)
     except Exception:
-        traceback.print_exc(); message.reply_text("Упс, не разобрал. Пример: «кабель 35мм» или «автомат 400А ABB».")
-
-# Reset
-@app.on_message(filters.private & filters.command("reset"))
-def reset_handler(_, message):
-    chat_history[message.from_user.id]=[]; message.reply_text("🧹 Память очищена!")
+        traceback.print_exc(); message.reply_text("Упс, не разобрал. Попробуй «📂 Категории» и фильтры.")
 
 # Завершение
 def _graceful_exit(sig, frame):
@@ -874,7 +965,6 @@ if __name__ == "__main__":
         if CATALOG_URL:
             if not fetch_catalog(force=True): log.warning("Каталог не удалось загрузить на старте")
             periodic_refresh()
-        # стартуем HTTP-хук в фоне
         t = _threading.Thread(target=_run_http_server, daemon=True); t.start()
         app.run()
     except Exception:
