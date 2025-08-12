@@ -10,29 +10,35 @@ import os, sys, re, requests, traceback, logging, signal, threading, io, csv, zi
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from io import BytesIO
-from datetime import datetime, timedelta, timezone  # ← timezone-aware
+from datetime import datetime, timedelta, timezone  # timezone-aware datetimes
 
-# ========================== ENV ==========================
+# ========================== ENV / CONFIG ==========================
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bot")
 load_dotenv()
 
+# обязательные
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID_STR = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
-
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OR_MODEL = os.getenv("OR_TEXT_MODEL", "openai/gpt-oss-120b")
-
 HF_TOKEN = os.getenv("HF_TOKEN")
+
+# опциональные / дефолты
+OR_MODEL = os.getenv("OR_TEXT_MODEL", "openai/gpt-oss-120b")
 HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "stabilityai/sdxl-turbo")
 
 CATALOG_URL = os.getenv("CATALOG_URL")
 CATALOG_AUTH_USER = os.getenv("CATALOG_AUTH_USER")
 CATALOG_AUTH_PASS = os.getenv("CATALOG_AUTH_PASS")
 CATALOG_REFRESH_MIN = int(os.getenv("CATALOG_REFRESH_MIN", "30"))
+
 TELEGRAM_ADMIN_ID = int(os.getenv("TELEGRAM_ADMIN_ID", "0"))
 MANAGER_CHAT_ID = int(os.getenv("MANAGER_CHAT_ID", "0"))
+
+# автообновление / уведомления
+AUTOSYNC_NOTIFY = os.getenv("AUTOSYNC_NOTIFY", "1") == "1"
+AUTOSYNC_REMIND_EVERY_MIN = int(os.getenv("AUTOSYNC_REMIND_EVERY_MIN", "120"))  # каждые 2 часа
 
 missing = [k for k, v in {
     "BOT_TOKEN": BOT_TOKEN, "API_ID": API_ID_STR, "API_HASH": API_HASH,
@@ -87,11 +93,18 @@ chat_history = defaultdict(list)
 HISTORY_LIMIT = 10
 def clamp_history(h): return h[-HISTORY_LIMIT:] if len(h) > HISTORY_LIMIT else h
 
-# ========================== Каталог (кэш) ==========================
+# ========================== Каталог / кэш ==========================
 catalog = []
 catalog_last_fetch = None
 catalog_lock = threading.Lock()
 pending_reserve = {}  # user_id -> product_id
+
+# состояние для автообновления/напоминаний
+_catalog_etag = None
+_catalog_last_modified = None
+_catalog_last_items = 0
+_catalog_last_change = None       # datetime UTC когда реально обновили состав
+_last_reminder_at = None          # datetime UTC когда отправляли последнее напоминание
 
 # ---- карточки/кнопки ----
 def product_caption(p):
@@ -104,7 +117,6 @@ def product_caption(p):
     ])
 
 def product_keyboard(p):
-    from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
     pid = p.get("id") or p.get("sku")
     btns = [[InlineKeyboardButton("📝 Забронировать", callback_data=f"reserve:{pid}")]]
     if p.get("category"):
@@ -181,19 +193,14 @@ def suggest_alternatives(intent, limit=6):
         if isinstance(val,(int,float)): al.append((abs(val-target), p))
     al.sort(key=lambda x:x[0]); return [p for _,p in al[:limit]]
 
-# ========================== Загрузчики каталогов ==========================
+# ========================== Парсеры каталогов ==========================
 def parse_tilda_yml(xml_bytes: bytes) -> list[dict]:
-    """
-    Парсер YML (Tilda/Яндекс.Маркет)
-    """
     root = ET.fromstring(xml_bytes)
-    # категории
     cat_map = {}
     for c in root.findall(".//categories/category"):
         cid = c.get("id") or ""
         name = (c.text or "").strip()
         if cid: cat_map[cid] = name
-
     items = []
     for o in root.findall(".//offers/offer"):
         sku = o.get("id") or (o.findtext("vendorCode") or "")
@@ -204,12 +211,10 @@ def parse_tilda_yml(xml_bytes: bytes) -> list[dict]:
         cat_id = o.findtext("categoryId") or ""
         category = cat_map.get(cat_id, "")
 
-        # собрать текст для эвристик из name + всех param
         text_for_parse = " ".join([
             name,
             " ".join([(p.text or "") for p in o.findall("param") if p is not None]),
         ]).lower()
-
         itype = "кабель" if "кабел" in text_for_parse else (
             "автомат" if ("автомат" in text_for_parse or "выключат" in text_for_parse) else (
                 "пускатель" if "пускател" in text_for_parse else ""
@@ -226,13 +231,12 @@ def parse_tilda_yml(xml_bytes: bytes) -> list[dict]:
             "type": itype, "brand": brand, "category": category,
             "amp": amp, "sqmm": sqmm,
             "price": float(price) if price else None,
-            "stock": None,  # обычно нет остатков в Tilda YML
+            "stock": None,
             "image_url": img
         })
     return items
 
 def parse_commerceml(xml_bytes: bytes) -> list[dict]:
-    """CommerceML: одиночный XML или ZIP (import.xml + offers.xml)."""
     def _parse_catalog(root):
         cat={}
         for t in root.findall(".//Товары/Товар"):
@@ -305,46 +309,69 @@ def parse_commerceml(xml_bytes: bytes) -> list[dict]:
             return items
     return _one(xml_bytes)
 
+# ========================== Загрузка каталога + автонапоминания ==========================
 def fetch_catalog(force=False):
     """
     Загружает каталог из CATALOG_URL: YML (Tilda/ЯМ), CommerceML (XML/ZIP), JSON, CSV.
+    Делает условные запросы (ETag/Last-Modified). При изменении — обновляет и уведомляет админа.
     """
-    global catalog, catalog_last_fetch
+    global catalog, catalog_last_fetch, _catalog_etag, _catalog_last_modified
+    global _catalog_last_items, _catalog_last_change
+
     with catalog_lock:
-        now = datetime.now(timezone.utc)  # ← timezone-aware
+        now = datetime.now(timezone.utc)
         if not force and catalog_last_fetch and now - catalog_last_fetch < timedelta(minutes=CATALOG_REFRESH_MIN):
             return False
         if not CATALOG_URL:
-            log.warning("CATALOG_URL не задан — пропускаю загрузку каталога"); return False
+            log.warning("CATALOG_URL не задан — пропускаю загрузку каталога")
+            return False
+
+        headers = {}
+        if _catalog_etag:
+            headers["If-None-Match"] = _catalog_etag
+        if _catalog_last_modified:
+            headers["If-Modified-Since"] = _catalog_last_modified
 
         auth = (CATALOG_AUTH_USER, CATALOG_AUTH_PASS) if CATALOG_AUTH_USER else None
+
         try:
-            r = requests.get(CATALOG_URL, auth=auth, timeout=60)
+            # попытка HEAD для быстрой проверки
+            try:
+                h = requests.head(CATALOG_URL, auth=auth, timeout=20)
+                if h.status_code in (200, 304):
+                    lm = h.headers.get("Last-Modified")
+                    et = h.headers.get("ETag")
+                    if not force and et and _catalog_etag and et == _catalog_etag:
+                        catalog_last_fetch = now
+                        return False
+                    if not force and lm and _catalog_last_modified and lm == _catalog_last_modified:
+                        catalog_last_fetch = now
+                        return False
+            except Exception:
+                pass
+
+            r = requests.get(CATALOG_URL, auth=auth, timeout=60, headers=headers)
+            if r.status_code == 304:
+                catalog_last_fetch = now
+                return False
             r.raise_for_status()
+
             ct = (r.headers.get("content-type") or "").lower()
             url_l = CATALOG_URL.lower()
 
             items = []
-
-            # 1) YML
             if "xml" in ct and url_l.endswith(".yml"):
                 items = parse_tilda_yml(r.content)
-
-            # 2) CommerceML / XML / ZIP (с фолбэком на YML)
             elif "xml" in ct or "zip" in ct or url_l.endswith((".xml", ".zip")):
                 try:
                     items = parse_commerceml(r.content)
                 except Exception:
                     items = parse_tilda_yml(r.content)
-
-            # 3) JSON
             elif "application/json" in ct or url_l.endswith(".json"):
                 data = r.json()
                 if not isinstance(data, list):
                     log.error("JSON корень не список"); return False
                 items = data
-
-            # 4) CSV
             elif "text/csv" in ct or url_l.endswith(".csv"):
                 f = io.StringIO(r.text); reader = csv.DictReader(f)
                 for row in reader:
@@ -380,27 +407,78 @@ def fetch_catalog(force=False):
 
             catalog = norm
             catalog_last_fetch = now
+
+            # обновляем маркеры
+            new_etag = r.headers.get("ETag")
+            new_lm = r.headers.get("Last-Modified")
+            if new_etag: _catalog_etag = new_etag
+            if new_lm: _catalog_last_modified = new_lm
+
+            changed = (len(catalog) != _catalog_last_items)
+            _catalog_last_items = len(catalog)
+            if changed:
+                _catalog_last_change = now
+
             log.info("Каталог обновлён: %d позиций (из %s)", len(catalog), CATALOG_URL)
+
+            # уведомление
+            if AUTOSYNC_NOTIFY and TELEGRAM_ADMIN_ID and changed:
+                try:
+                    app.send_message(
+                        TELEGRAM_ADMIN_ID,
+                        f"✅ Каталог обновлён: {len(catalog)} позиций\nИсточник: {CATALOG_URL}"
+                    )
+                except Exception:
+                    traceback.print_exc()
+
             return True
+
         except Exception as e:
-            traceback.print_exc(); log.error("Ошибка загрузки каталога: %s", e); return False
+            traceback.print_exc()
+            log.error("Ошибка загрузки каталога: %s", e)
+            return False
 
 def periodic_refresh():
+    """
+    Периодически подтягивает каталог и шлёт напоминание каждые AUTOSYNC_REMIND_EVERY_MIN,
+    если изменений не было с момента последнего обновления.
+    """
+    global _last_reminder_at
     try:
-        fetch_catalog(force=False)
-    finally:
-        threading.Timer(CATALOG_REFRESH_MIN*60, periodic_refresh).start()
+        updated = fetch_catalog(force=False)
+        now = datetime.now(timezone.utc)
 
-# ========================== Pyrogram (in_memory session) ==========================
+        # логика напоминаний: если давно не было изменений — напомнить
+        if TELEGRAM_ADMIN_ID and AUTOSYNC_NOTIFY and AUTOSYNC_REMIND_EVERY_MIN > 0:
+            last_change = _catalog_last_change or catalog_last_fetch
+            # если каталог вообще уже когда-то загружался
+            if last_change:
+                due_since_change = now - last_change >= timedelta(minutes=AUTOSYNC_REMIND_EVERY_MIN)
+                due_since_reminder = (not _last_reminder_at) or (now - _last_reminder_at >= timedelta(minutes=AUTOSYNC_REMIND_EVERY_MIN))
+                # напоминаем только если НЕ было изменений и настало время
+                if not updated and due_since_change and due_since_reminder:
+                    try:
+                        app.send_message(
+                            TELEGRAM_ADMIN_ID,
+                            "ℹ️ Каталог не обновлялся. Если в Tilda есть новые данные из 1С, "
+                            "нажми «Начать экспорт» на странице YML, затем введи /sync1c."
+                        )
+                        _last_reminder_at = now
+                    except Exception:
+                        traceback.print_exc()
+    finally:
+        threading.Timer(CATALOG_REFRESH_MIN * 60, periodic_refresh).start()
+
+# ========================== Pyrogram (только личные чаты, сессия в памяти) ==========================
 app = Client(
     "my_bot",
     bot_token=BOT_TOKEN,
     api_id=API_ID,
     api_hash=API_HASH,
-    in_memory=True  # ← ключевая правка: не создаёт/не требует файловую сессию
+    in_memory=True
 )
 
-# ========================== Команды / UI (Только ЛИЧНЫЕ чаты) ==========================
+# ========================== Команды / UI ==========================
 @app.on_message(filters.private & filters.command("start"))
 def start_handler(_, message):
     uid=message.from_user.id; chat_history[uid]=[]
@@ -419,7 +497,7 @@ def start_handler(_, message):
 
 @app.on_message(filters.private & filters.command("help"))
 def help_handler(_, message):
-    message.reply_text("Пиши текстом: «кабель 35мм», «автомат 400А ABB». Кнопки внизу: Каталог / Поиск / Сброс.")
+    message.reply_text("Пиши: «кабель 35мм», «автомат 400А ABB». Кнопки внизу: Каталог / Поиск / Сброс.")
 
 @app.on_message(filters.private & filters.command("ping"))
 def ping_handler(_, message): message.reply_text("pong ✅")
@@ -455,7 +533,7 @@ def handle_search_text(_, message, text):
         return
     message.reply_text("Ничего не нашлось 😕 Уточни запрос: бренд/ток/сечение.")
 
-# ---------- Inline (оставляем; можно вызывать из лички кнопкой "Искать в чате") ----------
+# ---------- Inline ----------
 @app.on_inline_query()
 def inline_query_handler(client, inline_query):
     q=inline_query.query.strip()
@@ -469,10 +547,8 @@ def inline_query_handler(client, inline_query):
             items.append(InlineQueryResultArticle(title=p.get("name","Товар"),
                 description=f"SKU: {p.get('sku','—')} | {p.get('price','—')} ₽",
                 input_message_content=InputTextMessageContent(caption), reply_markup=kb, id=str(idx)))
-    try:
-        inline_query.answer(items, cache_time=5, is_personal=True)
-    except Exception:
-        traceback.print_exc()
+    try: inline_query.answer(items, cache_time=5, is_personal=True)
+    except Exception: traceback.print_exc()
 
 # ---------- Callbacks ----------
 @app.on_callback_query()
@@ -548,7 +624,7 @@ def image_handler(_, message):
     except Exception:
         traceback.print_exc(); message.reply_text("Ошибка при генерации изображения 🎨")
 
-# ---------- Текст (личка) → поиск/альтернативы/AI ----------
+# ---------- Текст (личка) ----------
 @app.on_message(filters.private & filters.text & ~filters.command(["start","reset","img","catalog","find","sync1c","help","ping"]), group=1)
 def text_handler(_, message):
     uid=message.from_user.id; user_text=(message.text or "").strip(); low=user_text.lower()
@@ -612,6 +688,7 @@ if __name__ == "__main__":
         app.run()
     except Exception:
         traceback.print_exc(); sys.exit(1)
+
 
 
 
