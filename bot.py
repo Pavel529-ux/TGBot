@@ -110,7 +110,7 @@ HISTORY_LIMIT = 10
 def clamp_history(h): return h[-HISTORY_LIMIT:] if len(h) > HISTORY_LIMIT else h
 
 # ───────────── Каталог / кэш ─────────────
-catalog = []               # каждый товар: {id, sku, name, brand, category, image_url, price, stock, type, amp, sqmm, attrs: {Название: Значение}}
+catalog = []               # каждый товар: {..., attrs: {Название: Значение}}
 catalog_last_fetch = None
 catalog_lock = threading.Lock()
 pending_reserve = {}       # user_id -> product_id
@@ -120,11 +120,11 @@ catalog_index = {
     "categories": [],
     "brands_by_cat": {},      # cat -> Counter(brand)
     "attrs_by_cat": {},       # cat -> {attr_name -> Counter(values)}
-    "attr_steps_by_cat": {},  # cat -> [attr_name,...] (порядок шагов мастера)
+    "attr_steps_by_cat": {},  # cat -> [attr_name,...]
 }
 CAT_PAGE = 8
 ITEMS_PAGE = 5
-VALUES_PER_STEP = 8         # сколько значений атрибута показывать на кнопках
+VALUES_PER_STEP = 8
 
 # автонапоминания
 _catalog_etag = None
@@ -159,7 +159,6 @@ def send_product_message(message, p):
 # ───────────── Парсеры каталогов (YML, CommerceML) ─────────────
 def _normalize_attr_name(n: str) -> str:
     n = (n or "").strip()
-    # немного нормализации часто встречающихся полей
     replacements = {
         "Номинальный ток, А": "Номинальный ток, А",
         "Номинальный ток": "Номинальный ток, А",
@@ -191,7 +190,6 @@ def parse_tilda_yml(xml_bytes: bytes) -> list[dict]:
         cat_id = o.findtext("categoryId") or ""
         category = cat_map.get(cat_id, "") or "Без категории"
 
-        # собрать параметры
         attrs = {}
         for prm in o.findall("param"):
             an = prm.get("name") or ""
@@ -222,16 +220,13 @@ def parse_tilda_yml(xml_bytes: bytes) -> list[dict]:
     return items
 
 def parse_commerceml(xml_bytes: bytes) -> list[dict]:
-    # Попытка распарсить атрибуты из CommerceML (может отличаться у разных конфигураций)
     def _attrs_from(root, node):
         attrs = {}
-        # 1С может хранить в: <ЗначенияСвойств/ЗначенияСвойства><Наименование>..<Значение>..
         for z in node.findall(".//ЗначенияСвойств/ЗначенияСвойства"):
             an = z.findtext("Наименование") or ""
             av = z.findtext("Значение") or ""
             if an and av:
                 attrs[_normalize_attr_name(an)] = av.strip()
-        # Иногда встречается <ХарактеристикиТовара>
         for z in node.findall(".//ХарактеристикиТовара/ХарактеристикаТовара"):
             an = z.findtext("Наименование") or ""
             av = z.findtext("Значение") or ""
@@ -247,7 +242,6 @@ def parse_commerceml(xml_bytes: bytes) -> list[dict]:
             sku=(t.findtext("Артикул") or "") or _id
             brand=(t.findtext("Изготовитель/Наименование") or t.findtext("Бренд") or "").strip()
             image=(t.findtext("Картинка") or "").strip()
-            # категория по Ид группы
             catref=t.find(".//Группы/Ид"); category=(catref.text or "").strip() if catref is not None else "Без категории"
             attrs = _attrs_from(root, t)
 
@@ -260,7 +254,6 @@ def parse_commerceml(xml_bytes: bytes) -> list[dict]:
             if _id:
                 cat[_id]={"id":_id,"sku":sku,"name":name or sku,"brand":brand,"category":category,
                           "image_url":image,"type":itype,"amp":amp,"sqmm":sqmm,"attrs":attrs}
-        # заменим Ид группы на имя
         for g in root.findall(".//Группы/Группа"):
             gid=(g.findtext("Ид") or "").strip(); gname=(g.findtext("Наименование") or "").strip()
             if gid and gname:
@@ -334,23 +327,19 @@ def rebuild_index():
         cat = str(p.get("category","")).strip() or "Без категории"
         brand = (p.get("brand") or "").strip()
         if brand: brands_by_cat[cat][brand] += 1
-        # включим бренд и некоторые вычисляемые в attrs тоже для единого мастера
         attrs = dict(p.get("attrs") or {})
         if brand: attrs.setdefault("Бренд", brand)
         if isinstance(p.get("stock"), (int,float)):
             attrs.setdefault("Наличие", "В наличии" if p["stock"] > 0 else "Под заказ")
-        # нормализуем значения
         for an,av in attrs.items():
             an_norm = _normalize_attr_name(an)
             av_norm = str(av).strip()
             if not an_norm or not av_norm: continue
             attrs_by_cat[cat][an_norm][av_norm] += 1
 
-    # порядок шагов: сначала «Бренд», затем «Наличие», затем остальные по убыванию охвата
     steps_by_cat = {}
     for cat, amap in attrs_by_cat.items():
         keys = list(amap.keys())
-        # приоритет
         def _key_rank(k):
             if k.lower() == "бренд": return (0, -sum(amap[k].values()))
             if k.lower() == "наличие": return (1, -sum(amap[k].values()))
@@ -431,12 +420,11 @@ def fetch_catalog(force=False):
                         "amp": _i(row.get("amp")), "sqmm": _i(row.get("sqmm")),
                         "price": _f(row.get("price")), "stock": _i(row.get("stock")),
                         "image_url": row.get("image_url") or row.get("image") or row.get("Image"),
-                        "attrs": {}  # CSV атрибуты не парсим
+                        "attrs": {}
                     })
             else:
                 log.error("Неизвестный формат каталога: %s", ct or url_l); return False
 
-            # нормализация
             norm=[]
             for p in items:
                 if not p or not p.get("name"): 
@@ -525,7 +513,7 @@ def _run_http_server():
     except Exception:
         traceback.print_exc()
 
-# ───────────── Поиск / намерение (как раньше) ─────────────
+# ───────────── Поиск / намерение ─────────────
 INTENT = re.compile(
     r"(?P<what>кабель|провод|автомат|выключател[ьяь]|пускател[ьяи])?"
     r".*?(?P<num>\d{1,3})\s*(?P<unit>мм2|мм²|мм|sqmm|а|a)?",
@@ -589,9 +577,8 @@ def suggest_alternatives(intent, limit=6):
         if isinstance(val,(int,float)): al.append((abs(val-target), p))
     al.sort(key=lambda x:x[0]); return [p for _,p in al[:limit]]
 
-# ───────────── Помощники фильтрации ─────────────
+# ───────────── Продвинутые фильтры ─────────────
 def filter_items_by_advanced(cat_name: str, selections: dict) -> list:
-    """selections: {attr_name: value} — совпадение по attrs, а также "Бренд"/"Наличие" если есть."""
     cat = cat_name or "Без категории"
     items = [p for p in catalog if (str(p.get("category","")) or "Без категории") == cat]
     for an, val in selections.items():
@@ -606,11 +593,10 @@ def filter_items_by_advanced(cat_name: str, selections: dict) -> list:
         if an == "Бренд":
             items = [p for p in items if (p.get("brand") or "").strip().lower() == val.strip().lower()]
             continue
-        # обычный атрибут
         items = [p for p in items if val == (p.get("attrs") or {}).get(an)]
     return items
 
-# ───────────── Визуал «Категории» ─────────────
+# ───────────── Категории ─────────────
 def build_cat_list_kb(page: int = 1):
     cats = catalog_index.get("categories", [])
     total = len(cats)
@@ -622,14 +608,14 @@ def build_cat_list_kb(page: int = 1):
     chunk = cats[start:start+CAT_PAGE]
     rows = []
     for c in chunk:
-        rows.append([InlineKeyboardButton(f"{c}", callback_data=f"fw2:cat:{slugify(c)}|i:0|sel:")])  # старт мастера v2
+        rows.append([InlineKeyboardButton(f"{c}", callback_data=f"fw2:cat:{slugify(c)}|i:0|sel:")])
     nav = []
     if page > 1: nav.append(InlineKeyboardButton("« Назад", callback_data=f"cats:p:{page-1}"))
     if page < pages: nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"cats:p:{page+1}"))
     if nav: rows.append(nav)
     return InlineKeyboardMarkup(rows)
 
-# ───────────── Мастер динамических атрибутов (fw2) ─────────────
+# ───────────── Мастер динамических атрибутов (HTML) ─────────────
 def _cat_steps(cat):
     return catalog_index.get("attr_steps_by_cat", {}).get(cat, [])
 
@@ -637,7 +623,6 @@ def _cat_attr_values(cat, attr):
     return [v for v,_ in catalog_index.get("attrs_by_cat", {}).get(cat, {}).get(attr, Counter()).most_common()]
 
 def _decode_sel(sel_str: str) -> OrderedDict:
-    """sel_str = urlencoded JSON {"Атрибут": "Значение", ...}"""
     if not sel_str:
         return OrderedDict()
     try:
@@ -654,16 +639,16 @@ def _encode_sel(selections: OrderedDict) -> str:
 def wizard2_text(cat_slug: str, i: int, selections: OrderedDict):
     cat = unslugify(cat_slug)
     steps = _cat_steps(cat)
-    lines = [f"📂 Категория: *{cat}*",
+    lines = [f"📂 Категория: <b>{cat}</b>",
              "Выбирай параметры. Можно пропустить любой шаг или показать товары в любой момент."]
     if steps:
         for idx, an in enumerate(steps):
             mark = "✅" if an in selections else "—"
             val = selections.get(an, "не выбрано")
             pointer = " ← сейчас" if idx == i else ""
-            lines.append(f"{idx+1}) {an}: *{val}* {mark}{pointer}")
+            lines.append(f"{idx+1}) {an}: <b>{val}</b> {mark}{pointer}")
     else:
-        lines.append("_Для этой категории нет атрибутов._")
+        lines.append("<i>Для этой категории нет атрибутов.</i>")
     return "\n".join(lines)
 
 def kb_wizard2(cat_slug: str, i: int, selections: OrderedDict):
@@ -682,16 +667,13 @@ def kb_wizard2(cat_slug: str, i: int, selections: OrderedDict):
         else:
             rows.append([InlineKeyboardButton("Нет значений", callback_data="noop")])
 
-        # спец-выборы
         rows.append([
             InlineKeyboardButton("Пропустить", callback_data=f"fw2:cat:{cat_slug}|i:{i+1}|sel:{_encode_sel(selections)}"),
             InlineKeyboardButton("Показать сейчас ✅", callback_data=f"fw2show:cat:{cat_slug}|sel:{_encode_sel(selections)}")
         ])
 
-        # навигация
         nav = []
         if i > 0:
-            # Назад откатывает последний выбор, если текущий атрибут уже выбран — снимаем его
             sel_back = OrderedDict(selections)
             if an in sel_back:
                 sel_back.pop(an, None)
@@ -700,11 +682,9 @@ def kb_wizard2(cat_slug: str, i: int, selections: OrderedDict):
         rows.append(nav)
 
     else:
-        # шаги закончились — финальные варианты
         rows.append([InlineKeyboardButton("✅ Показать товары", callback_data=f"fw2show:cat:{cat_slug}|sel:{_encode_sel(selections)}")])
         rows.append([InlineKeyboardButton("← К категориям", callback_data="cats:p:1")])
 
-    # в любой момент можно вернуться к категориям
     rows.append([InlineKeyboardButton("← Категории", callback_data="cats:p:1")])
     return InlineKeyboardMarkup(rows)
 
@@ -712,9 +692,9 @@ def wizard2_edit(cq, cat_slug: str, i: int, selections: OrderedDict):
     txt = wizard2_text(cat_slug, i, selections)
     kb  = kb_wizard2(cat_slug, i, selections)
     try:
-        cq.message.edit_text(txt, reply_markup=kb, parse_mode="Markdown")
+        cq.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
     except Exception:
-        cq.message.reply_text(txt, reply_markup=kb, parse_mode="Markdown")
+        cq.message.reply_text(txt, reply_markup=kb, parse_mode="HTML")
 
 def wizard2_show_results(cq, cat_slug: str, selections: OrderedDict):
     cat = unslugify(cat_slug)
@@ -734,35 +714,101 @@ def wizard2_show_results(cq, cat_slug: str, selections: OrderedDict):
     if len(items) > 20:
         cq.message.reply_text(f"Показаны первые 20 из {len(items)}. Уточни фильтры или используй поиск.")
 
+# (legacy) простой мастер — тоже на HTML, на всякий случай
+def wizard_text(cat_slug: str, step: str, brand: str, in_stock: int):
+    cat = unslugify(cat_slug)
+    lines = [f"📂 Категория: <b>{cat}</b>", "Настрой фильтры по шагам:"]
+    lines.append(f"1) Бренд: <b>{(brand if brand else 'любой')}</b> {'✅' if step=='brand' else ''}")
+    lines.append(f"2) В наличии: <b>{'да' if in_stock==1 else 'все'}</b> {'✅' if step=='stock' else ''}")
+    if step == "confirm":
+        lines.append("")
+        lines.append("Нажми «Показать товары», чтобы увидеть результат.")
+    return "\n".join(lines)
+
+def kb_wizard_brand(cat_slug: str, brand: str, in_stock: int):
+    cat = unslugify(cat_slug)
+    top_brands = [b for b,_ in catalog_index.get("brands_by_cat", {}).get(cat, Counter()).most_common(8)]
+    rows = []
+    if not top_brands:
+        rows.append([InlineKeyboardButton("Нет брендов", callback_data="noop")])
+    else:
+        for b in top_brands:
+            mark = "• " if (brand and b.lower()==brand.lower()) else ""
+            rows.append([InlineKeyboardButton(f"{mark}{b}", callback_data=f"fw:cat:{cat_slug}|step:brand|b:{b}|s:{in_stock}")])
+        if brand:
+            rows.append([InlineKeyboardButton("Сбросить бренд", callback_data=f"fw:cat:{cat_slug}|step:brand|b:-|s:{in_stock}")])
+    rows.append([InlineKeyboardButton("Далее →", callback_data=f"fw:cat:{cat_slug}|step:stock|b:{brand or '-'}|s:{in_stock}")])
+    rows.append([InlineKeyboardButton("← К категориям", callback_data="cats:p:1")])
+    return InlineKeyboardMarkup(rows)
+
+def kb_wizard_stock(cat_slug: str, brand: str, in_stock: int):
+    rows = [
+        [InlineKeyboardButton(f"Только в наличии: {'✅' if in_stock==1 else '❌'}",
+                              callback_data=f"fw:cat:{cat_slug}|step:stock|b:{brand or '-'}|s:{0 if in_stock==1 else 1}")],
+        [InlineKeyboardButton("← Назад (бренд)", callback_data=f"fw:cat:{cat_slug}|step:brand|b:{brand or '-'}|s:{in_stock}"),
+         InlineKeyboardButton("Далее →", callback_data=f"fw:cat:{cat_slug}|step:confirm|b:{brand or '-'}|s:{in_stock}")],
+        [InlineKeyboardButton("← К категориям", callback_data="cats:p:1")]
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def kb_wizard_confirm(cat_slug: str, brand: str, in_stock: int):
+    rows = [
+        [InlineKeyboardButton("✅ Показать товары", callback_data=f"fw:show:{cat_slug}|b:{brand or '-'}|s:{in_stock}")],
+        [InlineKeyboardButton("← Назад (наличие)", callback_data=f"fw:cat:{cat_slug}|step:stock|b:{brand or '-'}|s:{in_stock}")],
+        [InlineKeyboardButton("← К категориям", callback_data="cats:p:1")]
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def edit_wizard(cq, cat_slug: str, step: str, brand: str, in_stock: int):
+    txt = wizard_text(cat_slug, step, brand if brand != "-" else "", in_stock)
+    if step == "brand":
+        kb = kb_wizard_brand(cat_slug, brand if brand != "-" else "", in_stock)
+    elif step == "stock":
+        kb = kb_wizard_stock(cat_slug, brand if brand != "-" else "", in_stock)
+    else:
+        kb = kb_wizard_confirm(cat_slug, brand if brand != "-" else "", in_stock)
+    try:
+        cq.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        cq.message.reply_text(txt, reply_markup=kb, parse_mode="HTML")
+
 # ───────────── Pyrogram ─────────────
 app = Client("my_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, in_memory=True)
 
 # ───────────── Команды / UI ─────────────
+def reply_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton("🏠 Старт"), KeyboardButton("📂 Категории")],
+        [KeyboardButton("📦 Каталог"), KeyboardButton("🔎 Поиск")],
+        [KeyboardButton("🧹 Сброс")]
+    ]
+    if user_id == TELEGRAM_ADMIN_ID:
+        rows.insert(1, [KeyboardButton("Обновить каталог")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
 @app.on_message(filters.private & filters.command("start"))
 def start_handler(_, message):
-    uid=message.from_user.id
-    chat_history[uid]=[]
-
-    base_rows = [[KeyboardButton("📦 Каталог"), KeyboardButton("📂 Категории")],
-                 [KeyboardButton("🔎 Поиск"), KeyboardButton("🧹 Сброс")]]
-    if uid == TELEGRAM_ADMIN_ID:
-        base_rows.insert(0, [KeyboardButton("Обновить каталог")])
-
-    kb_main = ReplyKeyboardMarkup(base_rows, resize_keyboard=True)
+    uid = message.from_user.id
+    chat_history[uid] = []
+    kb_main = reply_main_keyboard(uid)
     message.reply_text(
         "Привет! Я бот магазина ⚡ Выбирай «📂 Категории» → фильтры по шагам (в одном сообщении), "
         "или пиши: «контактор 25А катушка 220В IP20».",
         reply_markup=kb_main
     )
-
     kb_inline = InlineKeyboardMarkup([
         [InlineKeyboardButton("📂 Открыть категории", callback_data="cats:p:1")]
     ])
     message.reply_text("Быстрое меню:", reply_markup=kb_inline)
 
+# Кнопка, заменяющая /start (для всех пользователей)
+@app.on_message(filters.private & filters.text & filters.regex(r"^(🏠 Старт|Старт|Меню|Главное меню)$"))
+def start_button_handler(_, message):
+    return start_handler(_, message)
+
 @app.on_message(filters.private & filters.command("help"))
 def help_handler(_, message):
-    message.reply_text("Категории → мастер фильтров (динамические атрибуты по шагам). В любой момент: «Показать сейчас».")
+    message.reply_text("Категории → мастер фильтров (динамические атрибуты по шагам). В любой момент: «Показать сейчас». Кнопка «🏠 Старт» всегда возвращает в главное меню.")
 
 def show_catalog(_, message):
     if not catalog: message.reply_text("Каталог пока пуст, попробуйте позже."); return
@@ -801,7 +847,6 @@ def callbacks_handler(client, cq):
     try:
         data=cq.data or ""
 
-        # категории (пагинация)
         if data.startswith("cats:"):
             if data == "cats:refresh":
                 ok = fetch_catalog(force=True)
@@ -816,22 +861,19 @@ def callbacks_handler(client, cq):
             except Exception: cq.message.reply_text(txt, reply_markup=kb)
             return cq.answer()
 
-        # мастер v2: шаг
+        # мастер v2
         if data.startswith("fw2:cat:"):
-            # fw2:cat:<slug>|i:<index>|sel:<encoded>
             cat_slug = re.search(r"fw2:cat:([^|]+)", data).group(1)
             i = int(re.search(r"\|i:(-?\d+)", data).group(1))
             sel_str_m = re.search(r"\|sel:(.*)$", data)
             sel = _decode_sel(sel_str_m.group(1) if sel_str_m else "")
             cat = unslugify(cat_slug)
             steps = _cat_steps(cat)
-            # ограничим индекс
             if i < 0: i = 0
             if steps and i > len(steps): i = len(steps)
             wizard2_edit(cq, cat_slug, i, sel)
             return cq.answer()
 
-        # мастер v2: показать сейчас
         if data.startswith("fw2show:cat:"):
             cat_slug = re.search(r"fw2show:cat:([^|]+)", data).group(1)
             sel_str_m = re.search(r"\|sel:(.*)$", data)
@@ -906,6 +948,8 @@ def image_handler(_, message):
 @app.on_message(filters.private & filters.text & ~filters.command(["start","reset","img","catalog","find","sync1c","help"]), group=1)
 def text_handler(_, message):
     uid=message.from_user.id; user_text=(message.text or "").strip(); low=user_text.lower()
+    if low in ("🏠 старт","старт","меню","главное меню"):
+        return start_handler(_, message)
     if low in ("📦 каталог","каталог"): return show_catalog(_, message)
     if low in ("📂 категории","категории"):
         try: message.reply_text("Категории:", reply_markup=build_cat_list_kb(page=1))
@@ -950,6 +994,11 @@ def text_handler(_, message):
     except Exception:
         traceback.print_exc(); message.reply_text("Упс, не разобрал. Попробуй «📂 Категории» и фильтры.")
 
+# Reset (на всякий)
+@app.on_message(filters.private & filters.command("reset"))
+def reset_handler(_, message):
+    chat_history[message.from_user.id]=[]; message.reply_text("🧹 Память очищена!")
+
 # Завершение
 def _graceful_exit(sig, frame):
     logging.getLogger().info("Stop signal received (%s). Exiting...", sig)
@@ -969,6 +1018,7 @@ if __name__ == "__main__":
         app.run()
     except Exception:
         traceback.print_exc(); sys.exit(1)
+
 
 
 
