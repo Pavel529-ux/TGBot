@@ -222,7 +222,7 @@ def parse_tilda_yml(xml_bytes: bytes) -> list[dict]:
             " ".join([(p.text or "") for p in o.findall("param") if p is not None]),
         ]).lower()
         itype = "кабель" if "кабел" in text_for_parse else (
-            "автомат" if ("автомат" in text_for_parse or "выключат" in text_for_parse) else (
+            "автомат" if ("автомат" in text_for_parse или "выключат" in text_for_parse) else (
                 "пускатель" if "пускател" in text_for_parse else ""
             )
         )
@@ -534,7 +534,6 @@ def start_handler(_, message):
         reply_markup=kb_main
     )
 
-    # Доп. inline-меню (общим можно оставить)
     kb_inline = InlineKeyboardMarkup([
         [InlineKeyboardButton("📦 Каталог (топ-10)", callback_data="cat:all"),
          InlineKeyboardButton("🔎 Поиск (inline)", switch_inline_query_current_chat="")]
@@ -609,8 +608,8 @@ def callbacks_handler(client, cq):
             except Exception: traceback.print_exc()
         cq.answer()
 
-# Sync (команда и админская Reply-кнопка)
-@app.on_message(filters.private & (filters.command("sync1c") | filters.text("Обновить каталог")))
+# Sync (команда и админская Reply-кнопка) — FIX: regex вместо filters.text("…")
+@app.on_message(filters.private & (filters.command("sync1c") | filters.regex("^Обновить каталог$")))
 def sync1c_handler(_, message):
     if TELEGRAM_ADMIN_ID and message.from_user.id != TELEGRAM_ADMIN_ID:
         message.reply_text("❌ Недостаточно прав."); return
