@@ -5,6 +5,7 @@ from pyrogram.types import (
     InlineQueryResultPhoto, InlineQueryResultArticle, InputTextMessageContent,
     ReplyKeyboardMarkup, KeyboardButton
 )
+from pyrogram.enums import ParseMode
 from dotenv import load_dotenv
 import os, sys, re, requests, traceback, logging, signal, threading, io, csv, zipfile, json
 import xml.etree.ElementTree as ET
@@ -692,9 +693,9 @@ def wizard2_edit(cq, cat_slug: str, i: int, selections: OrderedDict):
     txt = wizard2_text(cat_slug, i, selections)
     kb  = kb_wizard2(cat_slug, i, selections)
     try:
-        cq.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+        cq.message.edit_text(txt, reply_markup=kb)  # parse_mode задан глобально
     except Exception:
-        cq.message.reply_text(txt, reply_markup=kb, parse_mode="HTML")
+        cq.message.reply_text(txt, reply_markup=kb)
 
 def wizard2_show_results(cq, cat_slug: str, selections: OrderedDict):
     cat = unslugify(cat_slug)
@@ -714,7 +715,7 @@ def wizard2_show_results(cq, cat_slug: str, selections: OrderedDict):
     if len(items) > 20:
         cq.message.reply_text(f"Показаны первые 20 из {len(items)}. Уточни фильтры или используй поиск.")
 
-# (legacy) простой мастер — тоже на HTML, на всякий случай
+# (legacy) простой мастер — на HTML, на всякий
 def wizard_text(cat_slug: str, step: str, brand: str, in_stock: int):
     cat = unslugify(cat_slug)
     lines = [f"📂 Категория: <b>{cat}</b>", "Настрой фильтры по шагам:"]
@@ -768,12 +769,19 @@ def edit_wizard(cq, cat_slug: str, step: str, brand: str, in_stock: int):
     else:
         kb = kb_wizard_confirm(cat_slug, brand if brand != "-" else "", in_stock)
     try:
-        cq.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+        cq.message.edit_text(txt, reply_markup=kb)  # parse_mode глобально
     except Exception:
-        cq.message.reply_text(txt, reply_markup=kb, parse_mode="HTML")
+        cq.message.reply_text(txt, reply_markup=kb)
 
 # ───────────── Pyrogram ─────────────
-app = Client("my_bot", bot_token=BOT_TOKEN, api_id=API_ID, api_hash=API_HASH, in_memory=True)
+app = Client(
+    "my_bot",
+    bot_token=BOT_TOKEN,
+    api_id=API_ID,
+    api_hash=API_HASH,
+    in_memory=True,
+    parse_mode=ParseMode.HTML  # глобальный parse_mode
+)
 
 # ───────────── Команды / UI ─────────────
 def reply_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
@@ -888,7 +896,7 @@ def callbacks_handler(client, cq):
         traceback.print_exc()
         cq.answer("Ошибка обработчика", show_alert=False)
 
-# /sync1c — только админ
+# /sync1c — только админ (и кнопка Reply «Обновить каталог»)
 @app.on_message(filters.private & (filters.command("sync1c") | filters.regex("^Обновить каталог$")))
 def sync1c_handler(_, message):
     if TELEGRAM_ADMIN_ID and message.from_user.id != TELEGRAM_ADMIN_ID:
@@ -994,7 +1002,7 @@ def text_handler(_, message):
     except Exception:
         traceback.print_exc(); message.reply_text("Упс, не разобрал. Попробуй «📂 Категории» и фильтры.")
 
-# Reset (на всякий)
+# Reset
 @app.on_message(filters.private & filters.command("reset"))
 def reset_handler(_, message):
     chat_history[message.from_user.id]=[]; message.reply_text("🧹 Память очищена!")
@@ -1018,6 +1026,7 @@ if __name__ == "__main__":
         app.run()
     except Exception:
         traceback.print_exc(); sys.exit(1)
+
 
 
 
