@@ -222,7 +222,7 @@ def parse_tilda_yml(xml_bytes: bytes) -> list[dict]:
             " ".join([(p.text or "") for p in o.findall("param") if p is not None]),
         ]).lower()
         itype = "кабель" if "кабел" in text_for_parse else (
-            "автомат" if ("автомат" in text_for_parse или "выключат" in text_for_parse) else (
+            "автомат" if ("автомат" in text_for_parse or "выключат" in text_for_parse) else (
                 "пускатель" if "пускател" in text_for_parse else ""
             )
         )
