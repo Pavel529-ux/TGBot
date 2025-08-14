@@ -1,5 +1,5 @@
 # bot.py
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     InlineQueryResultPhoto, InlineQueryResultArticle, InputTextMessageContent,
@@ -14,7 +14,6 @@ from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, quote, unquote
-import threading as _threading
 
 # ───────────── ENV / CONFIG ─────────────
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
@@ -44,7 +43,7 @@ AUTOSYNC_NOTIFY = os.getenv("AUTOSYNC_NOTIFY", "1") == "1"
 AUTOSYNC_REMIND_EVERY_MIN = int(os.getenv("AUTOSYNC_REMIND_EVERY_MIN", "120"))
 
 SECRET_EXPORT_TOKEN = os.getenv("SECRET_EXPORT_TOKEN")
-HTTP_PORT = int(os.getenv("PORT", "8000"))
+HTTP_PORT = int(os.getenv("PORT", "8080"))
 
 missing = [k for k, v in {
     "BOT_TOKEN": BOT_TOKEN, "API_ID": API_ID_STR, "API_HASH": API_HASH,
@@ -450,9 +449,14 @@ def fetch_catalog(force=False):
 
             log.info("Каталог обновлён: %d позиций (из %s)", len(catalog), CATALOG_URL)
 
+            # уведомление админу — только когда клиент уже стартовал
             if AUTOSYNC_NOTIFY and TELEGRAM_ADMIN_ID and changed:
                 try:
-                    app.send_message(TELEGRAM_ADMIN_ID, f"✅ Каталог обновлён: {len(catalog)} позиций\nИсточник: {CATALOG_URL}")
+                    if getattr(app, "is_connected", False):
+                        app.send_message(
+                            TELEGRAM_ADMIN_ID,
+                            f"✅ Каталог обновлён: {len(catalog)} позиций\nИсточник: {CATALOG_URL}"
+                        )
                 except Exception:
                     traceback.print_exc()
             return True
@@ -474,11 +478,13 @@ def periodic_refresh():
                 due_rem = (not _last_reminder_at) or (now - _last_reminder_at >= timedelta(minutes=AUTOSYNC_REMIND_EVERY_MIN))
                 if not updated and due_change and due_rem:
                     try:
-                        app.send_message(TELEGRAM_ADMIN_ID,
-                            "ℹ️ Каталог не обновлялся. Если в Tilda есть новые данные из 1С, "
-                            "нажми «Начать экспорт» в Tilda, затем /sync1c (или жми кнопку)."
-                        )
-                        _last_reminder_at = now
+                        if getattr(app, "is_connected", False):
+                            app.send_message(
+                                TELEGRAM_ADMIN_ID,
+                                "ℹ️ Каталог не обновлялся. Если в Tilda есть новые данные из 1С, "
+                                "нажми «Начать экспорт» в Tilda, затем «Обновить каталог» в боте."
+                            )
+                            _last_reminder_at = now
                     except Exception:
                         traceback.print_exc()
     finally:
@@ -496,7 +502,7 @@ class _HookHandler(BaseHTTPRequestHandler):
                 self.send_response(401); self.end_headers(); self.wfile.write(b"Unauthorized"); return
             ok = fetch_catalog(force=True)
             try:
-                if TELEGRAM_ADMIN_ID:
+                if TELEGRAM_ADMIN_ID and getattr(app, "is_connected", False):
                     app.send_message(TELEGRAM_ADMIN_ID, ("✅ Каталог обновлён немедленно" if ok else "ℹ️ Каталог не изменился (304)") + f"\nИсточник: {CATALOG_URL}")
             except Exception:
                 traceback.print_exc()
@@ -693,7 +699,7 @@ def wizard2_edit(cq, cat_slug: str, i: int, selections: OrderedDict):
     txt = wizard2_text(cat_slug, i, selections)
     kb  = kb_wizard2(cat_slug, i, selections)
     try:
-        cq.message.edit_text(txt, reply_markup=kb)  # parse_mode задан глобально
+        cq.message.edit_text(txt, reply_markup=kb)  # parse_mode глобально
     except Exception:
         cq.message.reply_text(txt, reply_markup=kb)
 
@@ -714,64 +720,6 @@ def wizard2_show_results(cq, cat_slug: str, selections: OrderedDict):
         except Exception: traceback.print_exc()
     if len(items) > 20:
         cq.message.reply_text(f"Показаны первые 20 из {len(items)}. Уточни фильтры или используй поиск.")
-
-# (legacy) простой мастер — на HTML, на всякий
-def wizard_text(cat_slug: str, step: str, brand: str, in_stock: int):
-    cat = unslugify(cat_slug)
-    lines = [f"📂 Категория: <b>{cat}</b>", "Настрой фильтры по шагам:"]
-    lines.append(f"1) Бренд: <b>{(brand if brand else 'любой')}</b> {'✅' if step=='brand' else ''}")
-    lines.append(f"2) В наличии: <b>{'да' if in_stock==1 else 'все'}</b> {'✅' if step=='stock' else ''}")
-    if step == "confirm":
-        lines.append("")
-        lines.append("Нажми «Показать товары», чтобы увидеть результат.")
-    return "\n".join(lines)
-
-def kb_wizard_brand(cat_slug: str, brand: str, in_stock: int):
-    cat = unslugify(cat_slug)
-    top_brands = [b for b,_ in catalog_index.get("brands_by_cat", {}).get(cat, Counter()).most_common(8)]
-    rows = []
-    if not top_brands:
-        rows.append([InlineKeyboardButton("Нет брендов", callback_data="noop")])
-    else:
-        for b in top_brands:
-            mark = "• " if (brand and b.lower()==brand.lower()) else ""
-            rows.append([InlineKeyboardButton(f"{mark}{b}", callback_data=f"fw:cat:{cat_slug}|step:brand|b:{b}|s:{in_stock}")])
-        if brand:
-            rows.append([InlineKeyboardButton("Сбросить бренд", callback_data=f"fw:cat:{cat_slug}|step:brand|b:-|s:{in_stock}")])
-    rows.append([InlineKeyboardButton("Далее →", callback_data=f"fw:cat:{cat_slug}|step:stock|b:{brand or '-'}|s:{in_stock}")])
-    rows.append([InlineKeyboardButton("← К категориям", callback_data="cats:p:1")])
-    return InlineKeyboardMarkup(rows)
-
-def kb_wizard_stock(cat_slug: str, brand: str, in_stock: int):
-    rows = [
-        [InlineKeyboardButton(f"Только в наличии: {'✅' if in_stock==1 else '❌'}",
-                              callback_data=f"fw:cat:{cat_slug}|step:stock|b:{brand or '-'}|s:{0 if in_stock==1 else 1}")],
-        [InlineKeyboardButton("← Назад (бренд)", callback_data=f"fw:cat:{cat_slug}|step:brand|b:{brand or '-'}|s:{in_stock}"),
-         InlineKeyboardButton("Далее →", callback_data=f"fw:cat:{cat_slug}|step:confirm|b:{brand or '-'}|s:{in_stock}")],
-        [InlineKeyboardButton("← К категориям", callback_data="cats:p:1")]
-    ]
-    return InlineKeyboardMarkup(rows)
-
-def kb_wizard_confirm(cat_slug: str, brand: str, in_stock: int):
-    rows = [
-        [InlineKeyboardButton("✅ Показать товары", callback_data=f"fw:show:{cat_slug}|b:{brand or '-'}|s:{in_stock}")],
-        [InlineKeyboardButton("← Назад (наличие)", callback_data=f"fw:cat:{cat_slug}|step:stock|b:{brand or '-'}|s:{in_stock}")],
-        [InlineKeyboardButton("← К категориям", callback_data="cats:p:1")]
-    ]
-    return InlineKeyboardMarkup(rows)
-
-def edit_wizard(cq, cat_slug: str, step: str, brand: str, in_stock: int):
-    txt = wizard_text(cat_slug, step, brand if brand != "-" else "", in_stock)
-    if step == "brand":
-        kb = kb_wizard_brand(cat_slug, brand if brand != "-" else "", in_stock)
-    elif step == "stock":
-        kb = kb_wizard_stock(cat_slug, brand if brand != "-" else "", in_stock)
-    else:
-        kb = kb_wizard_confirm(cat_slug, brand if brand != "-" else "", in_stock)
-    try:
-        cq.message.edit_text(txt, reply_markup=kb)  # parse_mode глобально
-    except Exception:
-        cq.message.reply_text(txt, reply_markup=kb)
 
 # ───────────── Pyrogram ─────────────
 app = Client(
@@ -801,7 +749,7 @@ def start_handler(_, message):
     kb_main = reply_main_keyboard(uid)
     message.reply_text(
         "Привет! Я бот магазина ⚡ Выбирай «📂 Категории» → фильтры по шагам (в одном сообщении), "
-        "или пиши: «контактор 25А катушка 220В IP20».",
+        "или пиши свободно: «контактор 25А катушка 220В IP20».",
         reply_markup=kb_main
     )
     kb_inline = InlineKeyboardMarkup([
@@ -869,7 +817,7 @@ def callbacks_handler(client, cq):
             except Exception: cq.message.reply_text(txt, reply_markup=kb)
             return cq.answer()
 
-        # мастер v2
+        # Мастер фильтров v2 (в одном сообщении)
         if data.startswith("fw2:cat:"):
             cat_slug = re.search(r"fw2:cat:([^|]+)", data).group(1)
             i = int(re.search(r"\|i:(-?\d+)", data).group(1))
@@ -1019,13 +967,27 @@ signal.signal(signal.SIGINT, _graceful_exit)
 if __name__ == "__main__":
     try:
         log.info("✅ Бот запускается...")
+        # 1) Стартуем клиента СНАЧАЛА
+        app.start()
+
+        # 2) После старта: грузим каталог и ставим таймер
         if CATALOG_URL:
-            if not fetch_catalog(force=True): log.warning("Каталог не удалось загрузить на старте")
+            if not fetch_catalog(force=True):
+                log.warning("Каталог не удалось загрузить на старте")
             periodic_refresh()
-        t = _threading.Thread(target=_run_http_server, daemon=True); t.start()
-        app.run()
+
+        # 3) Поднимаем HTTP-хук
+        threading.Thread(target=_run_http_server, daemon=True).start()
+
+        # 4) Держим процесс
+        idle()
+
     except Exception:
         traceback.print_exc(); sys.exit(1)
+    finally:
+        try: app.stop()
+        except Exception: pass
+
 
 
 
