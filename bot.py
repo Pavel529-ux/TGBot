@@ -13,9 +13,9 @@ from collections import defaultdict, Counter, OrderedDict
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, quote, unquote
+from urllib.parse import urlparse, parse_qs
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ───────────── ENV / CONFIG ─────────────
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bot")
 load_dotenv()
@@ -449,7 +449,6 @@ def fetch_catalog(force=False):
 
             log.info("Каталог обновлён: %d позиций (из %s)", len(catalog), CATALOG_URL)
 
-            # уведомление админу — только когда клиент уже стартовал
             if AUTOSYNC_NOTIFY and TELEGRAM_ADMIN_ID and changed:
                 try:
                     if getattr(app, "is_connected", False):
@@ -584,26 +583,24 @@ def suggest_alternatives(intent, limit=6):
         if isinstance(val,(int,float)): al.append((abs(val-target), p))
     al.sort(key=lambda x:x[0]); return [p for _,p in al[:limit]]
 
-# ───────────── Продвинутые фильтры ─────────────
-def filter_items_by_advanced(cat_name: str, selections: dict) -> list:
-    cat = cat_name or "Без категории"
-    items = [p for p in catalog if (str(p.get("category","")) or "Без категории") == cat]
-    for an, val in selections.items():
-        if not val or val == "-": 
-            continue
-        if an == "Наличие":
-            if val == "В наличии":
-                items = [p for p in items if isinstance(p.get("stock"), (int,float)) and p.get("stock", 0) > 0]
-            elif val == "Под заказ":
-                items = [p for p in items if not (isinstance(p.get("stock"), (int,float)) and p.get("stock", 0) > 0)]
-            continue
-        if an == "Бренд":
-            items = [p for p in items if (p.get("brand") or "").strip().lower() == val.strip().lower()]
-            continue
-        items = [p for p in items if val == (p.get("attrs") or {}).get(an)]
-    return items
+# ───────────── ФИЛЬТРЫ (Stateful Wizard v2) ─────────────
+WIZ2 = {}  # key=(chat_id, msg_id) → {"cat": str_slug, "i": int, "sel": OrderedDict()}
 
-# ───────────── Категории ─────────────
+def _cat_steps(cat):
+    return catalog_index.get("attr_steps_by_cat", {}).get(cat, [])
+
+def _cat_attr_values(cat, attr):
+    return [v for v,_ in catalog_index.get("attrs_by_cat", {}).get(cat, {}).get(attr, Counter()).most_common()]
+
+def _w2_key_from_cq(cq):
+    return (cq.message.chat.id, cq.message.id)
+
+def _w2_get(cat_slug, key=None):
+    return WIZ2.get(key)
+
+def _w2_set(key, data):
+    WIZ2[key] = data
+
 def build_cat_list_kb(page: int = 1):
     cats = catalog_index.get("categories", [])
     total = len(cats)
@@ -615,33 +612,12 @@ def build_cat_list_kb(page: int = 1):
     chunk = cats[start:start+CAT_PAGE]
     rows = []
     for c in chunk:
-        rows.append([InlineKeyboardButton(f"{c}", callback_data=f"fw2:cat:{slugify(c)}|i:0|sel:")])
+        rows.append([InlineKeyboardButton(f"{c}", callback_data=f"fw2start:{slugify(c)}")])
     nav = []
     if page > 1: nav.append(InlineKeyboardButton("« Назад", callback_data=f"cats:p:{page-1}"))
     if page < pages: nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"cats:p:{page+1}"))
     if nav: rows.append(nav)
     return InlineKeyboardMarkup(rows)
-
-# ───────────── Мастер динамических атрибутов (HTML) ─────────────
-def _cat_steps(cat):
-    return catalog_index.get("attr_steps_by_cat", {}).get(cat, [])
-
-def _cat_attr_values(cat, attr):
-    return [v for v,_ in catalog_index.get("attrs_by_cat", {}).get(cat, {}).get(attr, Counter()).most_common()]
-
-def _decode_sel(sel_str: str) -> OrderedDict:
-    if not sel_str:
-        return OrderedDict()
-    try:
-        data = json.loads(unquote(sel_str))
-        if isinstance(data, dict):
-            return OrderedDict(data)
-    except Exception:
-        pass
-    return OrderedDict()
-
-def _encode_sel(selections: OrderedDict) -> str:
-    return quote(json.dumps(selections, ensure_ascii=False))
 
 def wizard2_text(cat_slug: str, i: int, selections: OrderedDict):
     cat = unslugify(cat_slug)
@@ -667,44 +643,48 @@ def kb_wizard2(cat_slug: str, i: int, selections: OrderedDict):
         an = steps[i]
         values = _cat_attr_values(cat, an)[:VALUES_PER_STEP]
         if values:
-            for v in values:
-                sel2 = OrderedDict(selections)
-                sel2[an] = v
-                rows.append([InlineKeyboardButton(v, callback_data=f"fw2:cat:{cat_slug}|i:{i+1}|sel:{_encode_sel(sel2)}")])
+            # короткие callback-и: fw2v:<attr_idx>:<val_idx>
+            for vidx, v in enumerate(values):
+                rows.append([InlineKeyboardButton(v, callback_data=f"fw2v:{i}:{vidx}")])
         else:
             rows.append([InlineKeyboardButton("Нет значений", callback_data="noop")])
 
         rows.append([
-            InlineKeyboardButton("Пропустить", callback_data=f"fw2:cat:{cat_slug}|i:{i+1}|sel:{_encode_sel(selections)}"),
-            InlineKeyboardButton("Показать сейчас ✅", callback_data=f"fw2show:cat:{cat_slug}|sel:{_encode_sel(selections)}")
+            InlineKeyboardButton("Пропустить", callback_data=f"fw2skip:{i}"),
+            InlineKeyboardButton("Показать сейчас ✅", callback_data=f"fw2show")
         ])
 
         nav = []
         if i > 0:
-            sel_back = OrderedDict(selections)
-            if an in sel_back:
-                sel_back.pop(an, None)
-            nav.append(InlineKeyboardButton("← Назад", callback_data=f"fw2:cat:{cat_slug}|i:{i-1}|sel:{_encode_sel(sel_back)}"))
-        nav.append(InlineKeyboardButton("Сбросить", callback_data=f"fw2:cat:{cat_slug}|i:0|sel:"))
+            nav.append(InlineKeyboardButton("← Назад", callback_data=f"fw2back:{i}"))
+        nav.append(InlineKeyboardButton("Сбросить", callback_data=f"fw2reset"))
         rows.append(nav)
-
     else:
-        rows.append([InlineKeyboardButton("✅ Показать товары", callback_data=f"fw2show:cat:{cat_slug}|sel:{_encode_sel(selections)}")])
+        rows.append([InlineKeyboardButton("✅ Показать товары", callback_data=f"fw2show")])
         rows.append([InlineKeyboardButton("← К категориям", callback_data="cats:p:1")])
 
     rows.append([InlineKeyboardButton("← Категории", callback_data="cats:p:1")])
     return InlineKeyboardMarkup(rows)
 
-def wizard2_edit(cq, cat_slug: str, i: int, selections: OrderedDict):
-    txt = wizard2_text(cat_slug, i, selections)
-    kb  = kb_wizard2(cat_slug, i, selections)
+def wizard2_edit_message(cq):
+    key = _w2_key_from_cq(cq)
+    state = _w2_get(None, key=key)
+    if not state:
+        return
+    txt = wizard2_text(state["cat"], state["i"], state["sel"])
+    kb  = kb_wizard2(state["cat"], state["i"], state["sel"])
     try:
-        cq.message.edit_text(txt, reply_markup=kb)  # parse_mode глобально
+        cq.message.edit_text(txt, reply_markup=kb)
     except Exception:
         cq.message.reply_text(txt, reply_markup=kb)
 
-def wizard2_show_results(cq, cat_slug: str, selections: OrderedDict):
-    cat = unslugify(cat_slug)
+def wizard2_show_results(cq):
+    key = _w2_key_from_cq(cq)
+    state = _w2_get(None, key=key)
+    if not state:
+        return
+    cat = unslugify(state["cat"])
+    selections = state["sel"]
     items = filter_items_by_advanced(cat, selections)
     header = f"📦 Результаты для «{cat}»"
     if selections:
@@ -728,7 +708,7 @@ app = Client(
     api_id=API_ID,
     api_hash=API_HASH,
     in_memory=True,
-    parse_mode=ParseMode.HTML  # глобальный parse_mode
+    parse_mode=ParseMode.HTML
 )
 
 # ───────────── Команды / UI ─────────────
@@ -757,14 +737,13 @@ def start_handler(_, message):
     ])
     message.reply_text("Быстрое меню:", reply_markup=kb_inline)
 
-# Кнопка, заменяющая /start (для всех пользователей)
 @app.on_message(filters.private & filters.text & filters.regex(r"^(🏠 Старт|Старт|Меню|Главное меню)$"))
 def start_button_handler(_, message):
     return start_handler(_, message)
 
 @app.on_message(filters.private & filters.command("help"))
 def help_handler(_, message):
-    message.reply_text("Категории → мастер фильтров (динамические атрибуты по шагам). В любой момент: «Показать сейчас». Кнопка «🏠 Старт» всегда возвращает в главное меню.")
+    message.reply_text("Категории → мастер фильтров по шагам (в одном сообщении). Можно «Пропустить» шаг или «Показать сейчас». Кнопка «🏠 Старт» — главное меню.")
 
 def show_catalog(_, message):
     if not catalog: message.reply_text("Каталог пока пуст, попробуйте позже."); return
@@ -803,6 +782,7 @@ def callbacks_handler(client, cq):
     try:
         data=cq.data or ""
 
+        # Категории/пагинация
         if data.startswith("cats:"):
             if data == "cats:refresh":
                 ok = fetch_catalog(force=True)
@@ -817,24 +797,78 @@ def callbacks_handler(client, cq):
             except Exception: cq.message.reply_text(txt, reply_markup=kb)
             return cq.answer()
 
-        # Мастер фильтров v2 (в одном сообщении)
-        if data.startswith("fw2:cat:"):
-            cat_slug = re.search(r"fw2:cat:([^|]+)", data).group(1)
-            i = int(re.search(r"\|i:(-?\d+)", data).group(1))
-            sel_str_m = re.search(r"\|sel:(.*)$", data)
-            sel = _decode_sel(sel_str_m.group(1) if sel_str_m else "")
-            cat = unslugify(cat_slug)
-            steps = _cat_steps(cat)
-            if i < 0: i = 0
-            if steps and i > len(steps): i = len(steps)
-            wizard2_edit(cq, cat_slug, i, sel)
+        # ── Новый мастер фильтров (короткие колбэки) ──
+        if data.startswith("fw2start:"):
+            cat_slug = data.split(":",1)[1]
+            # инициализация сессии для текущего сообщения
+            key = (cq.message.chat.id, cq.message.id)
+            _w2_set(key, {"cat": cat_slug, "i": 0, "sel": OrderedDict()})
+            wizard2_edit_message(cq)
             return cq.answer()
 
-        if data.startswith("fw2show:cat:"):
-            cat_slug = re.search(r"fw2show:cat:([^|]+)", data).group(1)
-            sel_str_m = re.search(r"\|sel:(.*)$", data)
-            sel = _decode_sel(sel_str_m.group(1) if sel_str_m else "")
-            wizard2_show_results(cq, cat_slug, sel)
+        if data.startswith("fw2v:"):
+            # выбор значения: fw2v:<attr_index>:<val_index>
+            try:
+                _, aidx, vidx = data.split(":")
+                aidx = int(aidx); vidx = int(vidx)
+            except Exception:
+                return cq.answer()
+            key = _w2_key_from_cq(cq); st = _w2_get(None, key=key)
+            if not st: return cq.answer()
+            cat = unslugify(st["cat"]); steps = _cat_steps(cat)
+            if not steps or aidx<0 or aidx>=len(steps): return cq.answer()
+            an = steps[aidx]
+            values = _cat_attr_values(cat, an)[:VALUES_PER_STEP]
+            if not values or vidx<0 or vidx>=len(values): return cq.answer()
+            val = values[vidx]
+            st["sel"][an] = val
+            st["i"] = min(aidx+1, len(steps))  # следующий шаг или конец
+            _w2_set(key, st)
+            wizard2_edit_message(cq)
+            return cq.answer()
+
+        if data.startswith("fw2skip:"):
+            # пропуск шага
+            try:
+                _, aidx = data.split(":")
+                aidx = int(aidx)
+            except Exception:
+                return cq.answer()
+            key = _w2_key_from_cq(cq); st = _w2_get(None, key=key)
+            if not st: return cq.answer()
+            cat = unslugify(st["cat"]); steps = _cat_steps(cat)
+            st["i"] = min(aidx+1, len(steps))
+            _w2_set(key, st)
+            wizard2_edit_message(cq)
+            return cq.answer()
+
+        if data.startswith("fw2back:"):
+            try:
+                _, aidx = data.split(":"); aidx = int(aidx)
+            except Exception:
+                return cq.answer()
+            key = _w2_key_from_cq(cq); st = _w2_get(None, key=key)
+            if not st: return cq.answer()
+            cat = unslugify(st["cat"]); steps = _cat_steps(cat)
+            prev_i = max(0, aidx-1)
+            # удалим значение текущего шага, если было
+            if 0 <= aidx < len(steps):
+                st["sel"].pop(steps[aidx], None)
+            st["i"] = prev_i
+            _w2_set(key, st)
+            wizard2_edit_message(cq)
+            return cq.answer()
+
+        if data == "fw2reset":
+            key = _w2_key_from_cq(cq); st = _w2_get(None, key=key)
+            if not st: return cq.answer()
+            st["sel"].clear(); st["i"] = 0
+            _w2_set(key, st)
+            wizard2_edit_message(cq)
+            return cq.answer()
+
+        if data == "fw2show":
+            wizard2_show_results(cq)
             return cq.answer()
 
         if data == "noop":
@@ -967,19 +1001,17 @@ signal.signal(signal.SIGINT, _graceful_exit)
 if __name__ == "__main__":
     try:
         log.info("✅ Бот запускается...")
-        # 1) Стартуем клиента СНАЧАЛА
-        app.start()
+        app.start()  # СНАЧАЛА стартуем Pyrogram
 
-        # 2) После старта: грузим каталог и ставим таймер
+        # После старта: загрузка каталога и таймер
         if CATALOG_URL:
             if not fetch_catalog(force=True):
                 log.warning("Каталог не удалось загрузить на старте")
             periodic_refresh()
 
-        # 3) Поднимаем HTTP-хук
+        # HTTP-хук
         threading.Thread(target=_run_http_server, daemon=True).start()
 
-        # 4) Держим процесс
         idle()
 
     except Exception:
@@ -987,6 +1019,7 @@ if __name__ == "__main__":
     finally:
         try: app.stop()
         except Exception: pass
+
 
 
 
