@@ -14,8 +14,8 @@ from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-# ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("bot")
 load_dotenv()
@@ -136,10 +136,15 @@ _last_reminder_at = None
 # карточка товара
 def product_caption(p):
     price = p.get("price"); stock = p.get("stock")
+    def _fmt_price(val):
+        try:
+            return f"{float(val):,.0f}".replace(",", " ")
+        except Exception:
+            return str(val)
     return "\n".join([
         f"🛒 {p.get('name','')}",
         f"Артикул: {p.get('sku','—')}",
-        f"Цена: {price} ₽" if price is not None else "Цена: уточняйте",
+        f"Цена: {_fmt_price(price)} ₽" if price is not None else "Цена: уточняйте",
         f"В наличии: {stock} шт." if stock is not None else "Наличие: уточняйте",
     ])
 
@@ -583,6 +588,72 @@ def suggest_alternatives(intent, limit=6):
         if isinstance(val,(int,float)): al.append((abs(val-target), p))
     al.sort(key=lambda x:x[0]); return [p for _,p in al[:limit]]
 
+# ───────────── Доп. фильтрация для мастера (НОВОЕ) ─────────────
+def _norm(s):
+    return re.sub(r"\s+", " ", str(s or "")).strip().lower()
+
+def filter_items_by_advanced(category: str, selections: OrderedDict) -> list[dict]:
+    """
+    Фильтрует товары по категории + выбранным атрибутам (мастер фильтров).
+    Поддерживает: точное совпадение атрибута, мягкий матч по подстроке, "Бренд", "Наличие".
+    """
+    if not catalog:
+        return []
+
+    want_cat = (_norm(category) if category else "")
+    sel = selections or OrderedDict()
+
+    want_brand = _norm(sel.get("Бренд", ""))
+    want_avail = (sel.get("Наличие", "") or "").strip().lower()
+    attr_pairs = [(k, str(v)) for k, v in sel.items() if k not in ("Бренд", "Наличие")]
+
+    def ok_availability(p):
+        if not want_avail:
+            return True
+        stock = p.get("stock")
+        if not isinstance(stock, (int, float)):
+            return want_avail not in ("в наличии", "под заказ")
+        return (want_avail == "в наличии" and stock > 0) or (want_avail == "под заказ" and stock <= 0)
+
+    def ok_brand(p):
+        if not want_brand:
+            return True
+        return want_brand in _norm(p.get("brand"))
+
+    def ok_attrs(p):
+        if not attr_pairs:
+            return True
+        p_attrs = { _normalize_attr_name(k): str(v) for k, v in (p.get("attrs") or {}).items() }
+        for ak, av in attr_pairs:
+            ak_norm = _normalize_attr_name(ak)
+            pv = str(p_attrs.get(ak_norm, ""))
+            if _norm(av) not in _norm(pv):
+                return False
+        return True
+
+    res = []
+    for it in catalog:
+        if want_cat and _norm(it.get("category")) != want_cat:
+            continue
+        if not ok_brand(it):
+            continue
+        if not ok_availability(it):
+            continue
+        if not ok_attrs(it):
+            continue
+        res.append(it)
+
+    def _key(p):
+        stock = p.get("stock")
+        have = 1 if (isinstance(stock, (int, float)) and stock > 0) else 0
+        price = p.get("price")
+        price = float(price) if isinstance(price, (int, float)) else float("inf")
+        brand = _norm(p.get("brand"))
+        return (-have, price, brand)
+
+    res.sort(key=_key)
+    return res
+
 # ───────────── ФИЛЬТРЫ (Stateful Wizard v2) ─────────────
 WIZ2 = {}  # key=(chat_id, msg_id) → {"cat": str_slug, "i": int, "sel": OrderedDict()}
 
@@ -623,7 +694,7 @@ def wizard2_text(cat_slug: str, i: int, selections: OrderedDict):
     cat = unslugify(cat_slug)
     steps = _cat_steps(cat)
     lines = [f"📂 Категория: <b>{cat}</b>",
-             "Выбирай параметры. Можно пропустить любой шаг или показать товары в любой момент."]
+             "Выбирайте параметры. Можно «Пропустить» любой шаг или нажать «Показать сейчас ✅» в любой момент."]
     if steps:
         for idx, an in enumerate(steps):
             mark = "✅" if an in selections else "—"
@@ -643,7 +714,6 @@ def kb_wizard2(cat_slug: str, i: int, selections: OrderedDict):
         an = steps[i]
         values = _cat_attr_values(cat, an)[:VALUES_PER_STEP]
         if values:
-            # короткие callback-и: fw2v:<attr_idx>:<val_idx>
             for vidx, v in enumerate(values):
                 rows.append([InlineKeyboardButton(v, callback_data=f"fw2v:{i}:{vidx}")])
         else:
@@ -782,6 +852,20 @@ def callbacks_handler(client, cq):
     try:
         data=cq.data or ""
 
+        # Бронирование товара (НОВОЕ)
+        if data.startswith("reserve:"):
+            pid = data.split(":", 1)[1]
+            user_id = cq.from_user.id
+            pending_reserve[user_id] = pid
+            try:
+                cq.message.reply_text(
+                    "Окей! Отправьте, пожалуйста, номер телефона для связи 📞\n"
+                    "Пример: +7 999 123-45-67"
+                )
+            except Exception:
+                traceback.print_exc()
+            return cq.answer("Жду номер телефона")
+
         # Категории/пагинация
         if data.startswith("cats:"):
             if data == "cats:refresh":
@@ -800,14 +884,12 @@ def callbacks_handler(client, cq):
         # ── Новый мастер фильтров (короткие колбэки) ──
         if data.startswith("fw2start:"):
             cat_slug = data.split(":",1)[1]
-            # инициализация сессии для текущего сообщения
             key = (cq.message.chat.id, cq.message.id)
             _w2_set(key, {"cat": cat_slug, "i": 0, "sel": OrderedDict()})
             wizard2_edit_message(cq)
             return cq.answer()
 
         if data.startswith("fw2v:"):
-            # выбор значения: fw2v:<attr_index>:<val_index>
             try:
                 _, aidx, vidx = data.split(":")
                 aidx = int(aidx); vidx = int(vidx)
@@ -822,13 +904,12 @@ def callbacks_handler(client, cq):
             if not values or vidx<0 or vidx>=len(values): return cq.answer()
             val = values[vidx]
             st["sel"][an] = val
-            st["i"] = min(aidx+1, len(steps))  # следующий шаг или конец
+            st["i"] = min(aidx+1, len(steps))
             _w2_set(key, st)
             wizard2_edit_message(cq)
             return cq.answer()
 
         if data.startswith("fw2skip:"):
-            # пропуск шага
             try:
                 _, aidx = data.split(":")
                 aidx = int(aidx)
@@ -851,7 +932,6 @@ def callbacks_handler(client, cq):
             if not st: return cq.answer()
             cat = unslugify(st["cat"]); steps = _cat_steps(cat)
             prev_i = max(0, aidx-1)
-            # удалим значение текущего шага, если было
             if 0 <= aidx < len(steps):
                 st["sel"].pop(steps[aidx], None)
             st["i"] = prev_i
@@ -1002,6 +1082,13 @@ if __name__ == "__main__":
     try:
         log.info("✅ Бот запускается...")
         app.start()  # СНАЧАЛА стартуем Pyrogram
+
+        # Логирование инфо о боте (НОВОЕ)
+        try:
+            me = app.get_me()
+            log.info("🤖 Запущен бот: @%s (id=%s)", me.username, me.id)
+        except Exception:
+            traceback.print_exc()
 
         # После старта: загрузка каталога и таймер
         if CATALOG_URL:
